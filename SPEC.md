@@ -1,6 +1,6 @@
-# Mnemosyne — Complete Spec (Phases 1–2)
+# Mnemosyne — Spec (Phases 1–3)
 
-This is the implementation spec for Mnemosyne, a next-generation AI agent memory system. Phase 1 builds the foundation: SQLite schema, FTS5 search, embedding model, Zvec vector store, and a coordinating API. Phase 2 adds the async write pipeline: fast-path message intake, the two-stage Deriver (Extractor + Scorer) calling DeepSeek V3.2 via NousResearch, embedding, and multi-store writes.
+AI agent memory system. Phase 1: foundation (SQLite, FTS5, embeddings, Zvec). Phase 2: async write pipeline (Deriver via DeepSeek V3.2). Phase 3: retrieval pipeline (parallel search, RRF fusion, scoring, MMR dedup).
 
 ---
 
@@ -13,47 +13,52 @@ mnemosyne/
 ├── SPEC.md                     ← this file
 ├── mnemosyne/
 │   ├── __init__.py
-│   ├── config.py
-│   ├── models.py
+│   ├── config.py               # All constants, thresholds, API config
+│   ├── models.py               # Pydantic: Peer, Session, Message, Note, Link, TaskItem, RetrievalResult
 │   ├── db/
-│   │   ├── __init__.py
-│   │   └── sqlite_store.py
+│   │   └── sqlite_store.py     # All SQLite CRUD, FTS5 search, task queue, access tracking
 │   ├── vectors/
-│   │   ├── __init__.py
-│   │   ├── zvec_store.py
-│   │   └── embedder.py
+│   │   ├── zvec_store.py       # Zvec insert/search/delete wrapper
+│   │   └── embedder.py         # nomic-embed-text-v1.5 (ONNX preferred, PyTorch fallback)
 │   ├── api/
-│   │   ├── __init__.py
-│   │   └── memory_api.py
-│   ├── pipeline/               # Phase 2: write pipeline
-│   │   ├── __init__.py
-│   │   ├── intake.py           # Fast-path message ingestion
-│   │   ├── deriver.py          # Extractor + Scorer (DeepSeek V3.2)
-│   │   ├── handlers.py         # Task handlers (handle_derive)
-│   │   └── worker.py           # Queue worker loop + dispatch
+│   │   └── memory_api.py       # Public API coordinating all stores
+│   ├── pipeline/               # Phase 2: write path
+│   │   ├── __init__.py         # create_worker() factory
+│   │   ├── intake.py           # Fast-path message ingestion (<5ms)
+│   │   ├── deriver.py          # Extractor + Scorer (DeepSeek V3.2 via NousResearch)
+│   │   ├── handlers.py         # handle_derive: extract → score → embed → store
+│   │   └── worker.py           # Queue polling loop + dispatch
+│   ├── retrieval/              # Phase 3: read path
+│   │   ├── __init__.py         # create_retriever() factory
+│   │   ├── scorer.py           # Pure functions: decay, provenance weight, fatigue, composite
+│   │   ├── fusion.py           # RRF fusion + MMR dedup
+│   │   └── retriever.py        # Orchestrator: parallel search → fuse → score → dedup → return
 │   └── utils/
-│       ├── __init__.py
-│       └── ids.py
+│       └── ids.py              # ULID generation
 └── tests/
     ├── conftest.py
     ├── test_sqlite_store.py
     ├── test_zvec_store.py
     ├── test_embedder.py
     ├── test_memory_api.py
-    ├── test_worker.py           # Phase 2
-    ├── test_intake.py           # Phase 2
-    ├── test_deriver.py          # Phase 2
-    └── test_write_pipeline.py   # Phase 2 (integration)
+    ├── test_worker.py
+    ├── test_intake.py
+    ├── test_deriver.py
+    ├── test_write_pipeline.py      # Phase 2 integration
+    ├── test_scorer.py              # Phase 3: pure unit tests
+    ├── test_fusion.py              # Phase 3: RRF + MMR
+    ├── test_retriever.py           # Phase 3: integration with real stores
+    └── test_retrieval_pipeline.py  # Phase 3: end-to-end write-then-read
 ```
 
 ---
 
-## Dependencies (pyproject.toml)
+## Dependencies
 
 ```toml
 [project]
 name = "mnemosyne"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.20.0",
@@ -63,20 +68,22 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-ulid>=3.0.0",
     "httpx>=0.27.0",
+    "numpy>=1.26.0",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
 ```
 
-Do NOT add fastapi, uvicorn, ragatouille, or networkx. Those are later phases.
+Do NOT add fastapi, uvicorn, ragatouille, networkx, or google-genai yet. Those are Phase 4+.
+
+numpy is added in Phase 3 for MMR cosine similarity (already a transitive dep of sentence-transformers, but pinned explicitly since fusion.py imports it directly).
 
 ---
 
 ## config.py
+
+All constants live here. Key additions per phase are marked.
 
 ```python
 # Storage
@@ -91,23 +98,19 @@ EMBEDDING_DIM = 384
 EMBEDDING_QUERY_PREFIX = "search_query: "
 EMBEDDING_DOC_PREFIX = "search_document: "
 
-# Retrieval
-RRF_K = 60
-
 # Schema
 SCHEMA_VERSION = 1
+RRF_K = 60
 
-# Provenance
+# Provenance values
 PROVENANCE_ORGANIC = "organic"
 PROVENANCE_AGENT_PROMPTED = "agent_prompted"
 PROVENANCE_USER_CONFIRMED = "user_confirmed"
 PROVENANCE_INFERRED = "inferred"
 
-# Note types
+# Note types / durability
 NOTE_TYPE_OBSERVATION = "observation"
 NOTE_TYPE_INFERENCE = "inference"
-
-# Durability
 DURABILITY_PERMANENT = "permanent"
 DURABILITY_CONTEXTUAL = "contextual"
 DURABILITY_EPHEMERAL = "ephemeral"
@@ -121,7 +124,7 @@ DEFAULT_CONFIDENCE_INFERENCE = 0.6
 DEFAULT_CONFIDENCE_USER_SET = 1.0
 DEFAULT_EMOTIONAL_WEIGHT = 0.5
 
-# Deriver API (Phase 2)
+# --- Phase 2: Deriver API ---
 NOUSRESEARCH_BASE_URL = "https://portal.nousresearch.com/api-docs"
 NOUSRESEARCH_MODEL = "deepseek/deepseek-v3.2"
 DERIVER_EXTRACT_TEMPERATURE = 0.1
@@ -130,392 +133,182 @@ DERIVER_MAX_RETRIES = 3
 DERIVER_RETRY_DELAYS = [1.0, 2.0, 4.0]
 WORKER_POLL_INTERVAL = 2.0
 
-
+# --- Phase 3: Retrieval scoring ---
+PROVENANCE_WEIGHTS = {"organic": 1.0, "user_confirmed": 0.8, "agent_prompted": 0.5, "inferred": 0.3}
+DECAY_BASE_LAMBDA = 0.1          # Base decay rate
+DECAY_IMPORTANCE_FACTOR = 0.8    # How much importance slows decay
+DECAY_ACCESS_BOOST = 0.15        # Per-access strength boost
+DECAY_MIN_MEMORIES = 100         # Decay disabled below this count
+DECAY_RAMP_MAX = 1000            # Decay reaches full effect here
+DECAY_HIGH_IMPORTANCE_FLOOR = 0.3  # Min strength for importance >= 0.7
+SURFACING_FATIGUE_FACTOR = 0.1
+MMR_SIMILARITY_THRESHOLD = 0.90
+INFERENCE_SCORE_DISCOUNT = 0.7   # Inferences weighted lower than observations
+RETRIEVAL_FTS_LIMIT = 30
+RETRIEVAL_VECTOR_LIMIT = 30
+RETRIEVAL_FINAL_LIMIT = 10
 ```
 
 ---
 
 ## SQLite Schema
 
-### PRAGMAs (apply on every connection open)
-
+PRAGMAs applied on every connection:
 ```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA cache_size = -8000;
-PRAGMA busy_timeout = 5000;
-PRAGMA mmap_size = 268435456;
-PRAGMA temp_store = MEMORY;
-PRAGMA foreign_keys = ON;
+PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8000;
+PRAGMA busy_timeout=5000; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;
+PRAGMA foreign_keys=ON;
 ```
 
-### Tables
+All PKs are TEXT (ULIDs). Timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
 
-All PKs are TEXT (ULIDs). All timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
+**Tables:** config, peers, sessions, messages, notes, links, task_queue. See `sqlite_store.py` for full DDL. The critical table is **notes**:
 
-**config**: key (PK), value, updated_at. Insert `('schema_version', '1')` on init.
+| Column group | Columns |
+|---|---|
+| Identity | id, peer_id, session_id, source_message_id |
+| Content | content, context_description, keywords (JSON), tags (JSON) |
+| Classification | note_type, provenance, durability |
+| Scoring | emotional_weight, importance, confidence |
+| Frequency | evidence_count, unique_sessions_mentioned |
+| Retrieval state | q_value, access_count, last_accessed_at, times_surfaced, decay_score |
+| Pipeline state | is_buffered, canonical_note_id, zvec_id |
+| Timestamps | created_at, updated_at |
 
-**peers**: id (PK), name, peer_type ('user'|'agent' default 'user'), static_profile (JSON nullable), profile_updated_at (nullable), created_at, metadata (JSON default '{}').
-
-**sessions**: id (PK), peer_id (FK→peers), started_at, ended_at (nullable), summary (nullable), metadata (JSON). Indexes: peer_id, started_at.
-
-**messages**: id (PK), session_id (FK→sessions), peer_id (FK→peers), role ('user'|'assistant'|'system'), content, created_at, metadata (JSON). Indexes: session_id, created_at.
-
-**notes** — the core memory unit:
-- id (PK), peer_id (FK), session_id (FK nullable), source_message_id (FK nullable)
-- content (TEXT NOT NULL), context_description (nullable), keywords (JSON array default '[]'), tags (JSON array default '[]')
-- note_type ('observation'|'inference' default 'observation'), provenance (default 'organic'), durability (default 'contextual')
-- emotional_weight (REAL default 0.5), importance (REAL default 0.0), confidence (REAL default 0.8)
-- evidence_count (INT default 1), unique_sessions_mentioned (INT default 1)
-- q_value (REAL default 0.0), access_count (INT default 0), last_accessed_at (nullable), times_surfaced (INT default 0), decay_score (REAL default 1.0)
-- is_buffered (INT default 1), canonical_note_id (nullable)
-- created_at, updated_at
-- zvec_id (nullable)
-- Indexes: peer_id, session_id, note_type, durability, is_buffered, decay_score, importance, created_at
-
-**links**: id (PK), source_note_id (FK→notes), target_note_id (FK→notes), link_type, strength (REAL default 0.5), created_at, metadata (JSON). UNIQUE(source_note_id, target_note_id, link_type). Indexes: source, target, type.
-
-**task_queue**: id (PK), task_type, payload (JSON), status ('pending'|'processing'|'completed'|'failed'|'dead_letter' default 'pending'), priority (INT default 0), attempts (INT default 0), max_attempts (INT default 3), error (nullable), created_at, started_at (nullable), completed_at (nullable). Index: (status, priority DESC).
-
-### FTS5
-
-```sql
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-    content, context_description, keywords, tags,
-    content='notes', content_rowid='rowid'
-);
-```
-
-REQUIRED sync triggers (without these, FTS5 returns nothing):
-
-```sql
--- After INSERT: copy new row into FTS
-CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-    INSERT INTO notes_fts(rowid, content, context_description, keywords, tags)
-    VALUES (new.rowid, new.content, new.context_description, new.keywords, new.tags);
-END;
-
--- After DELETE: remove from FTS
-CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, content, context_description, keywords, tags)
-    VALUES ('delete', old.rowid, old.content, old.context_description, old.keywords, old.tags);
-END;
-
--- After UPDATE: delete old + insert new
-CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, content, context_description, keywords, tags)
-    VALUES ('delete', old.rowid, old.content, old.context_description, old.keywords, old.tags);
-    INSERT INTO notes_fts(rowid, content, context_description, keywords, tags)
-    VALUES (new.rowid, new.content, new.context_description, new.keywords, new.tags);
-END;
-```
-
-### SQLiteStore CRUD Methods
-
-All async. Parameterized queries only.
-
-- **Peers**: create_peer, get_peer, update_peer, list_peers
-- **Sessions**: create_session, get_session, end_session, list_sessions(peer_id)
-- **Messages**: add_message, get_messages(session_id, limit), get_recent_context(session_id, n_turns)
-- **Notes**: create_note, get_note, update_note, delete_note, list_notes(peer_id, filters), get_buffered_notes(peer_id)
-- **Links**: create_link, get_links(note_id), delete_link
-- **Task queue**: enqueue_task, dequeue_task(task_type) — atomic claim via UPDATE...RETURNING, complete_task, fail_task (with dead_letter transition when attempts >= max_attempts)
-- **FTS5**: fts_search(query, peer_id, limit) — match on notes_fts, join to notes, filter by peer_id, return with BM25 scores
+**FTS5** virtual table on (content, context_description, keywords, tags) with sync triggers for INSERT/UPDATE/DELETE. Without triggers, FTS5 returns nothing.
 
 ---
 
-## Embedder (mnemosyne/vectors/embedder.py)
+## SQLiteStore Methods
 
-Wraps nomic-embed-text-v1.5. Handles prefix prepending internally — callers pass raw text. Uses ONNX backend for ~3x CPU speedup, with PyTorch fallback.
+**Phases 1–2** (already implemented): CRUD for peers/sessions/messages/notes/links. Task queue with atomic dequeue (UPDATE...RETURNING). `fts_search()` with BM25 scoring.
 
-```python
-class Embedder:
-    def __init__(self):
-        """
-        Load model with trust_remote_code=True, truncate_dim=384.
-        Try backend="onnx" first (requires onnxruntime). If ONNX fails
-        for any reason (missing dep, export error, etc.), fall back to
-        PyTorch backend. Log which backend loaded.
-        """
+**Phase 3 additions:**
 
-    @property
-    def dimension(self) -> int: return 384
-
-    @property
-    def backend(self) -> str:
-        """Return 'onnx' or 'torch' depending on which loaded."""
-
-    def embed_document(self, text: str) -> list[float]:
-        """Prepends 'search_document: ' then encodes."""
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Batch version."""
-
-    def embed_query(self, query: str) -> list[float]:
-        """Prepends 'search_query: ' then encodes."""
-```
-
-Convert numpy arrays to `list[float]` for Zvec. Embeddings are L2-normalized by default.
+- `fts_search_ranked(query, peer_id, limit=30)` → note dicts with 0-indexed `fts_rank` positions (not just BM25 scores). RRF needs rank positions, not raw scores.
+- `get_notes_by_ids(note_ids)` → fetch full rows for a list of IDs. Used to hydrate Zvec results from SQLite.
+- `record_access(note_ids)` → batch UPDATE incrementing access_count, times_surfaced, and setting last_accessed_at. Single transaction. Called after retrieval returns final results.
+- `count_notes(peer_id)` → integer count. Used by decay scoring to check if decay is active.
 
 ---
 
-## ZvecStore (mnemosyne/vectors/zvec_store.py)
+## Embedder / ZvecStore / MemoryAPI
 
-```python
-class ZvecStore:
-    def __init__(self, data_dir: str):
-        """Open/create 384-dim FP32 collection."""
+Already implemented in Phases 1–2. See source files for details.
 
-    def insert(self, note_id: str, embedding: list[float]) -> None
-    def insert_batch(self, items: list[tuple[str, list[float]]]) -> None
-    def search(self, query_embedding: list[float], top_k: int = 20) -> list[dict]
-    def delete(self, note_id: str) -> None
-    def optimize(self) -> None
-    def stats(self) -> dict
-```
-
-Wrap all calls in try/except. Do not let Zvec errors crash the system.
-
----
-
-## MemoryAPI (mnemosyne/api/memory_api.py)
-
-Coordinates SQLite + Zvec + Embedder. This is the public interface for direct operations.
-
-```python
-class MemoryAPI:
-    async def initialize(self) -> None
-    async def close(self) -> None
-
-    async def create_peer(name, peer_type="user") -> Peer
-    async def get_peer(peer_id) -> Peer | None
-
-    async def start_session(peer_id) -> Session
-    async def end_session(session_id) -> Session
-
-    async def add_message(session_id, peer_id, role, content) -> Message
-
-    async def add_note(peer_id, content, session_id=None, note_type="observation",
-                       provenance="organic", durability="contextual",
-                       emotional_weight=0.5, keywords=None, tags=None,
-                       context_description=None) -> Note
-
-    async def get_note(note_id) -> Note | None
-
-    async def search_keyword(query, peer_id, limit=20) -> list[Note]
-    async def search_vector(query, peer_id, top_k=20) -> list[tuple[Note, float]]
-    async def search_hybrid(query, peer_id, limit=10) -> list[tuple[Note, float]]
-```
-
-**add_note** flow: generate ULID → embed content → insert SQLite → insert Zvec → optimize → return Note.
-
-**search_vector** flow: embed query → Zvec search → fetch full notes from SQLite → filter by peer_id → return (Note, score) tuples.
-
-**search_hybrid** uses RRF: run keyword + vector in parallel, combine with `rrf_score = Σ 1/(60 + rank_i)`, sort descending, return top limit.
-
----
-
-## Models (Pydantic)
-
-Define: Peer, Session, Message, Note, Link, TaskItem. Each with all columns from its table. Include `from_row()` classmethods to construct from aiosqlite Row dicts.
+**Key facts for Phase 3:**
+- `Embedder.embed_query(text)` prepends `"search_query: "`, returns 384-dim L2-normalized list[float].
+- `Embedder.embed_documents(texts)` batch version for MMR embedding.
+- `ZvecStore.search(query_embedding, top_k)` returns `[{"id": str, "score": float}, ...]`.
+- Zvec has **no scalar fields/filtering** — returns results across all peers. Post-filter by peer_id after hydrating from SQLite.
+- MemoryAPI gains `retrieve(query, peer_id, limit)` which delegates to the Retriever.
 
 ---
 
 ## Write Pipeline (Phase 2)
 
-The user never waits for memory processing. Everything after the fast-path SQLite write is async.
+Already implemented. Brief summary for context:
 
-### Intake (mnemosyne/pipeline/intake.py)
+1. **intake.py**: `ingest_message()` writes to SQLite + enqueues "derive" task for user messages. Assistant messages stored but not derived. < 5ms.
+2. **deriver.py**: `Deriver.extract()` → atomic facts from user message. `Deriver.score()` → tags each note with emotional_weight, provenance, durability, keywords, tags, context_description. Both call DeepSeek V3.2 via NousResearch (httpx, not openai SDK). Retry 3x with 1/2/4s backoff.
+3. **handlers.py**: `handle_derive()` wires extract → score → embed → store (SQLite + Zvec).
+4. **worker.py**: polls task queue, dispatches to handlers, manages retries/dead-letter.
 
-Fast-path message ingestion. Synchronous write + enqueue, < 5ms target.
-
-```python
-async def ingest_message(
-    session_id: str,
-    peer_id: str,
-    role: str,
-    content: str,
-    db: SQLiteStore,
-) -> str:
-    """
-    1. Write message to messages table via db.add_message()
-    2. If role == "user":
-       a. Fetch preceding context via db.get_recent_context(session_id, n_turns=3)
-       b. Enqueue task via db.enqueue_task(
-            task_type="derive",
-            payload={
-                "message_id": message_id,
-                "session_id": session_id,
-                "peer_id": peer_id,
-                "content": content,
-                "preceding_turns": [...],  # list of {role, content} dicts
-            }
-          )
-    3. Return message_id immediately.
-
-    Assistant messages are stored but do NOT trigger derivation.
-    """
-```
-
-### Deriver (mnemosyne/pipeline/deriver.py)
-
-Two-stage LLM pipeline calling DeepSeek V3.2 via NousResearch.
-
-```python
-class Deriver:
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str = NOUSRESEARCH_BASE_URL,
-        model: str = NOUSRESEARCH_MODEL,
-    ):
-        """Create httpx.AsyncClient. Store config."""
-
-    async def extract(
-        self,
-        user_message: str,
-        preceding_turns: list[dict],
-    ) -> list[dict]:
-        """
-        Deriver Call 1 — Extractor.
-
-        System prompt instructs the model to:
-        - Extract atomic fact notes from the user's message ONLY
-        - Read preceding turns for context but NEVER extract from assistant messages
-        - If user confirms something agent said, mark is_confirmation=true
-        - Return JSON: {"notes": [{"text": str, "is_confirmation": bool}, ...]}
-
-        API call:
-        - POST {base_url}/chat/completions
-        - Headers: Content-Type, Authorization: Bearer {api_key}
-        - Body: model, messages, temperature=0.1, response_format={"type": "json_object"}
-
-        Retry: 3 attempts with 1s/2s/4s backoff on 429 and 5xx.
-        On persistent parse failure: return empty list, log error.
-
-        Returns: list of {"text": str, "is_confirmation": bool}
-        """
-
-    async def score(self, notes: list[dict]) -> list[dict]:
-        """
-        Deriver Call 2 — Scorer.
-
-        System prompt instructs the model to tag each note with:
-        - emotional_weight (0.0-1.0)
-        - provenance: "organic"|"agent_prompted"|"user_confirmed"|"inferred"
-          (pass through "user_confirmed" if is_confirmation was true)
-        - durability: "permanent"|"contextual"|"ephemeral"
-        - keywords: list[str]
-        - tags: list[str]
-        - context_description: str
-
-        Returns JSON: {"scored_notes": [{all original fields + metadata}, ...]}
-
-        Same retry/backoff logic as extract().
-        Returns: list of fully-scored note dicts.
-        """
-
-    async def close(self) -> None:
-        """Close httpx client."""
-```
-
-**Critical rules for Deriver prompts:**
-- Agent responses are READ for context but NEVER extracted from
-- Exception: user confirmation ("yeah that's right") → provenance: "user_confirmed"
-- Each note must be atomic — one fact per note
-- Empty extraction is valid (some messages contain no memorable facts)
-
-### Handler (mnemosyne/pipeline/handlers.py)
-
-Wires the full derive pipeline together.
-
-```python
-async def handle_derive(
-    task: TaskItem,
-    db: SQLiteStore,
-    deriver: Deriver,
-    embedder: Embedder,
-    zvec: ZvecStore,
-) -> None:
-    """
-    Full derive handler, called by the Worker when task_type="derive".
-
-    Steps:
-    1. Parse payload: message_id, session_id, peer_id, content, preceding_turns
-    2. Extract: notes = await deriver.extract(content, preceding_turns)
-       - If empty, return early (some messages have no extractable facts)
-    3. Score: scored_notes = await deriver.score(notes)
-    4. For each scored note:
-       a. Embed: embedding = embedder.embed_document(note["text"])
-       b. Store in SQLite via db.create_note(
-            peer_id, content, session_id, source_message_id,
-            note_type="observation", provenance, durability, emotional_weight,
-            keywords, tags, context_description,
-            is_buffered=1,  ← marks as waiting for Dreamer
-          )
-       c. Store embedding in Zvec via zvec.insert(note_id, embedding)
-          - If Zvec fails: log error, do NOT raise. SQLite write already succeeded.
-            Leave zvec_id as NULL for later retry.
-       d. If Zvec succeeded: await db.update_note(note_id, zvec_id=note_id)
-    5. Log: number of notes extracted, scored, stored + per-stage latency.
-    """
-```
-
-**Important:** Notes go into the `notes` table with `is_buffered=1`. There is NO separate `raw_notes` table. The `is_buffered` flag is what the Dreamer (Phase 5) uses to find unprocessed notes.
-
-### Worker (mnemosyne/pipeline/worker.py)
-
-Polls SQLiteStore for pending tasks and dispatches to registered handlers.
-
-```python
-class Worker:
-    def __init__(self, db: SQLiteStore, handler_map: dict[str, Callable]):
-        """
-        db: SQLiteStore instance (has enqueue/dequeue/complete/fail methods)
-        handler_map: {"derive": handle_derive, ...}
-        """
-
-    async def run(self, poll_interval: float = WORKER_POLL_INTERVAL) -> None:
-        """
-        Loop forever:
-        1. Call db.dequeue_task() — atomic claim via UPDATE...RETURNING
-        2. If no task, sleep poll_interval and continue
-        3. Look up handler from handler_map[task.task_type]
-        4. Call handler(task, ...) in try/except
-        5. On success: db.complete_task(task.id)
-        6. On failure: if task.attempts < task.max_attempts → db.fail_task()
-           resets status to 'pending' and increments attempts.
-           If attempts >= max_attempts → set status to 'dead_letter'.
-        """
-
-    async def run_once(self) -> bool:
-        """Process one task and return. Returns True if a task was processed.
-        Used for testing — avoids infinite loop."""
-```
-
-The Worker does NOT own any SQL. All queue CRUD lives on SQLiteStore. The Worker only contains the polling loop and dispatch logic.
-
-### Factory (mnemosyne/pipeline/__init__.py)
-
-```python
-def create_worker(db: SQLiteStore, deriver: Deriver, embedder: Embedder, zvec: ZvecStore) -> Worker:
-    """Wraps handle_derive with all dependencies injected, returns a Worker."""
-```
+**Critical rules**: Agent responses are read for context but NEVER extracted from. User confirmations get `provenance: "user_confirmed"`. Notes stored with `is_buffered=1` for the Dreamer (Phase 5).
 
 ---
 
-## API Configuration (Phase 2)
+## Retrieval Pipeline (Phase 3)
 
-| Setting | Value |
-|---------|-------|
-| Provider | NousResearch |
-| Base URL | `https://inference-api.nousresearch.com/v1` |
-| Model | `deepseek/deepseek-v3.2` |
-| Auth | `Authorization: Bearer $NOUSRESEARCH_API_KEY` |
-| HTTP client | `httpx.AsyncClient` (never openai SDK) |
-| Temperature | 0.1 for both Extractor and Scorer |
-| Response format | `{"type": "json_object"}` |
-| Retry | 3 attempts, 1s/2s/4s backoff on 429 + 5xx |
+No new external dependencies. No LLM calls. Pure local computation. Target: < 80ms end-to-end.
+
+```
+Query
+  ├→ embed_query() ──→ Zvec search (top 30)
+  ├→ FTS5 search (top 30)
+  │         ↓
+  │    Hydrate from SQLite + peer_id filter
+  │         ↓
+  │    RRF Fusion (k=60)
+  │         ↓
+  │    Score multipliers: decay × provenance × fatigue × inference_discount
+  │         ↓
+  │    MMR Dedup (cosine > 0.90 → drop lower-scored)
+  │         ↓
+  │    Top-N (default 10) → record_access() → return
+```
+
+### scorer.py — Pure scoring functions
+
+All functions are stateless, no I/O. Take note metadata, return floats.
+
+**`compute_decay_strength(importance, days_since_access, access_count, total_memories) → float`**
+- Formula: `strength = importance * exp(-lambda_eff * days) * (1 + 0.15 * access_count)` where `lambda_eff = 0.1 * (1 - importance * 0.8)`
+- Disabled (returns 1.0) when total_memories < 100
+- Ramps linearly between 100–1000 memories: `ramp = min(1.0, total / 1000)`
+- Floor of 0.3 for importance >= 0.7
+- Clamped to [0.0, 1.0]
+
+**`compute_provenance_weight(provenance) → float`**
+- Lookup from `PROVENANCE_WEIGHTS`. Unknown → 0.5.
+
+**`compute_surfacing_fatigue(times_surfaced) → float`**
+- Formula: `1 / (1 + 0.1 * times_surfaced)`
+
+**`compute_inference_discount(note_type) → float`**
+- "inference" → 0.7, else → 1.0
+
+**`compute_composite_score(rrf_score, decay, provenance, fatigue, inference_discount) → float`**
+- Multiply all factors together.
+
+### fusion.py — RRF + MMR
+
+**`rrf_fuse(ranked_lists: list[list[str]], k=60) → dict[str, float]`**
+- For each note across all lists: `score += 1 / (k + rank)` (0-indexed).
+- Notes in multiple lists get multiple contributions.
+
+**`mmr_dedup(scored_ids, embeddings: dict[str, list[float]], threshold=0.90) → list[str]`**
+- Walk sorted IDs. Skip any candidate with cosine > threshold to an already-accepted result.
+- nomic embeddings are L2-normalized, so cosine = dot product (use `np.dot`).
+- Missing embeddings → auto-accept the note.
+
+### retriever.py — Orchestrator
+
+**`Retriever.__init__(db, zvec, embedder)`** — stores references.
+
+**`Retriever.retrieve(query, peer_id, limit=10) → list[RetrievalResult]`**
+
+Steps:
+1. **Parallel search**: FTS5 (async) overlapped with embed_query (sync ~10ms) + Zvec search (sync ~2-5ms).
+2. **Hydrate**: collect all unique IDs → `db.get_notes_by_ids()` → filter by peer_id.
+3. **RRF fusion**: build two ranked ID lists → `rrf_fuse()`. Track source ("fts"/"vector"/"both").
+4. **Score**: `db.count_notes(peer_id)`. For each note compute days_since_access (from last_accessed_at or created_at), then call all scorer functions → composite score.
+5. **Sort + MMR dedup**: sort by composite → batch-embed candidates via `embedder.embed_documents()` → `mmr_dedup()`. Cap on-the-fly embedding to ≤ 10 FTS-only notes to avoid latency spikes.
+6. **Truncate** to `limit`.
+7. **Record access**: `db.record_access(final_ids)` — best-effort, never blocks.
+8. **Return** `list[RetrievalResult]` sorted by score descending.
+
+**Error handling**: Zvec fails → FTS-only. FTS fails → vector-only. Both fail → empty list. record_access failure → log, still return.
+
+### RetrievalResult (models.py)
+
+```python
+class RetrievalResult(BaseModel):
+    note: Note
+    score: float              # Final composite score
+    rrf_score: float          # Raw RRF before multipliers
+    decay_strength: float
+    provenance_weight: float
+    fatigue_factor: float
+    source: str               # "fts" | "vector" | "both"
+```
+
+### retrieval/__init__.py
+
+```python
+def create_retriever(db, zvec, embedder) -> Retriever:
+    return Retriever(db=db, zvec=zvec, embedder=embedder)
+```
 
 ---
 
@@ -524,57 +317,56 @@ def create_worker(db: SQLiteStore, deriver: Deriver, embedder: Embedder, zvec: Z
 | Path | Target | Notes |
 |------|--------|-------|
 | Fast path (write + enqueue) | < 5ms | User never waits past this |
-| Extractor API call | ~1-3s | Async, fire-and-forget |
-| Scorer API call | ~0.5-1s | Async, shorter input |
-| Embedding (per note) | ~10ms | CPU, nomic-embed-text-v1.5 |
-| Zvec insert (per note) | < 1ms | In-process |
-| Full async pipeline | < 5s total | Not user-facing |
+| Full async write pipeline | < 5s | Not user-facing |
+| FTS5 search | < 1ms | SQLite in-process |
+| Zvec vector search | ~2-5ms | HNSW in-process |
+| Query embedding | ~10ms | Single call |
+| RRF + scoring | < 1ms | Pure math, ~60 candidates |
+| MMR dedup | ~20-50ms | Batch embed + dot products |
+| **Full retrieval** | **< 80ms** | **User-facing** |
 
 ---
 
 ## Environment Variables
 
 ```bash
-# Required for Phase 2
-export NOUSRESEARCH_API_KEY="your-nousresearch-API-key"
+export NOUSRESEARCH_API_KEY="your-key"   # Required for Phase 2 Deriver
 ```
+
+No new env vars for Phase 3.
 
 ---
 
 ## Tests
 
-All use `tmp_path` fixture for isolation. All DeepSeek API calls are mocked — never make real API calls in the test suite.
+All use `tmp_path`. All API calls mocked.
 
-### Phase 1 Tests
+### Phase 1
+- **test_sqlite_store.py**: schema, CRUD, FTS5 triggers, task queue atomic dequeue, dead-letter.
+- **test_embedder.py**: 384-dim, deterministic, doc vs query prefix produces different vectors.
+- **test_zvec_store.py**: insert+query, batch, delete, empty query.
+- **test_memory_api.py**: full round trip peer→session→message→note→search (keyword, vector, hybrid).
 
-**test_sqlite_store.py**: Schema creates all tables. CRUD works. FTS5 finds notes. FTS5 triggers sync correctly (insert→findable, delete→gone, update→reflects new content). Task queue atomic dequeue works. Dead-letter transition after max_attempts.
+### Phase 2
+- **test_worker.py**: run_once, empty queue, exception handling, dead-letter.
+- **test_intake.py**: user enqueues, assistant doesn't, preceding context, FTS5 findable.
+- **test_deriver.py**: extraction, confirmation, empty, scorer fields, retry on 429, garbage JSON.
+- **test_write_pipeline.py**: full round trip ingest→derive→notes in SQLite+Zvec+FTS5.
 
-**test_embedder.py**: Model loads. Returns exactly 384-dim. Different texts→different embeddings. Same text→identical. Doc vs query prefix→different embeddings for same raw text.
-
-**test_zvec_store.py**: Insert+query finds the doc. Batch insert returns ranked results. Delete removes from results. Empty query returns [].
-
-**test_memory_api.py**: Full round trip: create peer → start session → add message → add note → keyword search finds it → vector search finds it → hybrid search finds it. Notes exist in both SQLite and Zvec independently.
-
-### Phase 2 Tests
-
-**test_worker.py**: Worker.run_once() processes a pending task and calls the handler. Returns False when queue is empty. Catches handler exceptions and calls fail_task. Dead-letter after max_attempts. Atomic dequeue prevents double-processing.
-
-**test_intake.py**: User message writes to SQLite and enqueues a derive task. Assistant message writes but does NOT enqueue. Preceding context correctly gathered (up to 3 turns). Message findable via FTS5 after ingestion.
-
-**test_deriver.py**: Extraction produces atomic notes (mocked API). Confirmation detection works. Empty message → empty list. Scorer returns all required fields with correct types. Scorer passes through user_confirmed provenance. Retry on 429. Graceful failure on garbage JSON. Scorer with empty input → no API call.
-
-**test_write_pipeline.py** (integration): Full round trip — ingest_message → worker processes task → notes exist in SQLite with all metadata → notes findable via FTS5 → notes findable via Zvec → task status is "completed". Pipeline survives API failure + retry. Empty extraction completes gracefully. Assistant messages produce no derived notes.
+### Phase 3
+- **test_scorer.py**: Pure unit tests. decay disabled < 100 memories. decay ramps 100–1000. high-importance floor. provenance weights match config. fatigue monotonically decreasing. composite multiplies all factors.
+- **test_fusion.py**: RRF scores overlapping > non-overlapping. MMR drops similarity > 0.90, keeps orthogonal. Order preserved. Missing embeddings auto-accepted.
+- **test_retriever.py**: basic retrieval, FTS+vector overlap gets source="both", peer isolation, access tracking updates, empty results, Zvec failure fallback, FTS failure fallback, MMR dedup of near-identical notes, provenance ordering, decay ordering, result limit respected.
+- **test_retrieval_pipeline.py**: end-to-end write-then-read. Multiple sessions. Surfacing fatigue increases across repeated queries. Mixed provenance ordering.
 
 ---
 
 ## Design Principles
 
-1. **User never waits for memory processing.** Everything after the SQLite write is async.
-2. **Raw data is immutable.** Notes in Stream 1 (is_buffered or not) are ground truth.
-3. **Frequency ≠ importance.** Two-dimensional scoring (emotional weight × frequency) prevents topic domination.
-4. **Memory informs, doesn't dominate.** Anti-sycophancy guards prevent self-reinforcing loops.
-5. **Decay scores, never deletes.** All data is preserved; relevance is temporal.
-6. **Expertise stays dynamic.** Not in the static profile to prevent model over-anchoring.
-7. **Agent responses are context, not memory.** Read but never stored as the user's attributes.
-8. **Ephemeral things fade naturally.** Durability classification prevents task noise from polluting long-term memory.
-9. **Graceful degradation.** If Zvec fails, SQLite still has the data. If the API fails, retry. If retry fails, dead-letter for inspection.
+1. **User never waits for memory processing.** Write path is async; read path is < 80ms.
+2. **Raw data is immutable.** Stream 1 observations are ground truth.
+3. **Frequency ≠ importance.** Two-dimensional scoring prevents topic domination.
+4. **Decay scores, never deletes.** All data preserved; relevance is temporal.
+5. **Agent responses are context, not memory.** Read but never stored as user attributes.
+6. **Graceful degradation.** If one search backend fails, the other still returns results.
+7. **No LLM calls in the read path** (Phase 3). ColBERT/MemR3 are Phase 4+.
