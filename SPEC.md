@@ -1,6 +1,6 @@
 # Mnemosyne — Complete Spec (Phases 1–2)
 
-This is the implementation spec for Mnemosyne, a next-generation AI agent memory system. Phase 1 builds the foundation: SQLite schema, FTS5 search, embedding model, Zvec vector store, and a coordinating API. Phase 2 adds the async write pipeline: fast-path message intake, the two-stage Deriver (Extractor + Scorer) calling DeepSeek V3.2 via OpenRouter, embedding, and multi-store writes.
+This is the implementation spec for Mnemosyne, a next-generation AI agent memory system. Phase 1 builds the foundation: SQLite schema, FTS5 search, embedding model, Zvec vector store, and a coordinating API. Phase 2 adds the async write pipeline: fast-path message intake, the two-stage Deriver (Extractor + Scorer) calling DeepSeek V3.2 via NousResearch, embedding, and multi-store writes.
 
 ---
 
@@ -122,17 +122,15 @@ DEFAULT_CONFIDENCE_USER_SET = 1.0
 DEFAULT_EMOTIONAL_WEIGHT = 0.5
 
 # Deriver API (Phase 2)
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = "deepseek/deepseek-v3.2"
+NOUSRESEARCH_BASE_URL = "https://portal.nousresearch.com/api-docs"
+NOUSRESEARCH_MODEL = "deepseek/deepseek-v3.2"
 DERIVER_EXTRACT_TEMPERATURE = 0.1
 DERIVER_SCORE_TEMPERATURE = 0.1
 DERIVER_MAX_RETRIES = 3
 DERIVER_RETRY_DELAYS = [1.0, 2.0, 4.0]
 WORKER_POLL_INTERVAL = 2.0
 
-# OpenRouter optional attribution headers
-OPENROUTER_REFERER = "https://github.com/MnesosyneAI/mnemosyne"
-OPENROUTER_TITLE = "Mnemosyne"
+
 ```
 
 ---
@@ -361,15 +359,15 @@ async def ingest_message(
 
 ### Deriver (mnemosyne/pipeline/deriver.py)
 
-Two-stage LLM pipeline calling DeepSeek V3.2 via OpenRouter.
+Two-stage LLM pipeline calling DeepSeek V3.2 via NousResearch.
 
 ```python
 class Deriver:
     def __init__(
         self,
         api_key: str,
-        base_url: str = OPENROUTER_BASE_URL,
-        model: str = OPENROUTER_MODEL,
+        base_url: str = NOUSRESEARCH_BASE_URL,
+        model: str = NOUSRESEARCH_MODEL,
     ):
         """Create httpx.AsyncClient. Store config."""
 
@@ -510,10 +508,10 @@ def create_worker(db: SQLiteStore, deriver: Deriver, embedder: Embedder, zvec: Z
 
 | Setting | Value |
 |---------|-------|
-| Provider | OpenRouter (NousResearch credits) |
-| Base URL | `https://openrouter.ai/api/v1` |
+| Provider | NousResearch |
+| Base URL | `https://inference-api.nousresearch.com/v1` |
 | Model | `deepseek/deepseek-v3.2` |
-| Auth | `Authorization: Bearer $OPENROUTER_API_KEY` |
+| Auth | `Authorization: Bearer $NOUSRESEARCH_API_KEY` |
 | HTTP client | `httpx.AsyncClient` (never openai SDK) |
 | Temperature | 0.1 for both Extractor and Scorer |
 | Response format | `{"type": "json_object"}` |
@@ -538,7 +536,7 @@ def create_worker(db: SQLiteStore, deriver: Deriver, embedder: Embedder, zvec: Z
 
 ```bash
 # Required for Phase 2
-export OPENROUTER_API_KEY="your-nousresearch-openrouter-key"
+export NOUSRESEARCH_API_KEY="your-nousresearch-API-key"
 ```
 
 ---
