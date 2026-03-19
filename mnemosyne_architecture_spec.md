@@ -72,15 +72,18 @@ This is a critical architectural decision. Data exists in three forms:
 
 ### Deriver (async, two sequential API calls)
 
-**Call 1 — Extractor (DeepSeek R1, off-peak)**
+**Call 1 — Extractor (DeepSeek V3.2 Chat via NousResearch)**
+- Provider: NousResearch inference API (`https://inference-api.nousresearch.com/v1`)
 - Input: the user's full message + 2-3 preceding turns (both user and agent) for context
 - Job: extract atomic fact notes from the user's message only
 - Agent responses are READ for context but NEVER extracted from
 - Exception: if user confirms something agent said ("yeah that's right"), attribute the confirmed fact to the user with `provenance: user_confirmed`
 - Output: list of atomic observation notes
-- Cost estimate: ~1,000 input + ~1,000 thinking + ~200 output = ~$0.00012 off-peak
+- Cost estimate: ~1,000 input + ~200 output = ~$0.00037
+- **Upgrade path**: if extraction quality is insufficient, swap to Qwen 3.5 ($0.44/$2.62) or Kimi K2.5 ($0.50/$2.40) via the same NousResearch endpoint — both offer stronger reasoning at ~5-10× the cost
 
-**Call 2 — Scorer (DeepSeek V3 Chat, cheaper)**
+**Call 2 — Scorer (DeepSeek V3.2 Chat via NousResearch)**
+- Provider: NousResearch inference API (`https://inference-api.nousresearch.com/v1`)
 - Input: just the extracted notes (short text)
 - Job: tag each note with:
   - `emotional_weight` (0.0-1.0): detected from language signals — possessives, named entities, strong verbs/adjectives, temporal attachment ("6 years") = high weight
@@ -89,7 +92,7 @@ This is a critical architectural decision. Data exists in three forms:
   - `keywords`: for A-MEM note construction
   - `tags`: categorical labels
   - `context_description`: brief summary of conversational context
-- Cost estimate: ~300 input + ~500 thinking + ~150 output = ~$0.00005 off-peak
+- Cost estimate: ~300 input + ~150 output = ~$0.00015
 
 **After scoring:**
 - Notes are embedded using nomic-embed-text-v1.5 on CPU (~10ms per note)
@@ -116,7 +119,7 @@ frequency_score = 1 - e^(-0.15 × unique_sessions_mentioned)
 
 The exponential curve means sessions 1-5 matter most, 5-15 matter somewhat, 15+ barely moves the needle. This ensures a topic mentioned in 50 sessions doesn't dominate over something mentioned once with high emotional weight.
 
-### Dreamer (background process, DeepSeek batch API)
+### Dreamer (background process, Gemini 3 Flash Batch API)
 - Receives clean, weighted, deduplicated notes
 - Performs:
   - **Link generation**: find neighbors for new notes, create typed bidirectional links (Stream 2)
@@ -250,15 +253,160 @@ This is critical. MIT's February 2026 study proved that condensed user profiles 
 
 ## API pricing (async Deriver)
 
+**NousResearch inference endpoint:** `https://inference-api.nousresearch.com/v1` (OpenAI-compatible)
+
 | Provider | Model | Use case | Input $/M | Output $/M |
 |----------|-------|----------|-----------|------------|
-| DeepSeek (off-peak) | R1 Reasoner | Extractor (Call 1) | $0.07 | $0.105 |
-| DeepSeek (off-peak) | V3.2 Chat | Scorer (Call 2) | $0.07 | $0.105 |
-| DeepSeek (standard) | V3.2 Reasoner | Fallback | $0.28 | $0.42 |
-| Cerebras | Various | Fast inference option | Variable | Variable |
-| Google Batch | Gemini 2.5 Flash | Dreamer batch | $0.15 | $1.25 |
+| NousResearch | DeepSeek V3.2 Chat | Extractor (Call 1) | $0.28 | $0.45 |
+| NousResearch | DeepSeek V3.2 Chat | Scorer (Call 2) | $0.28 | $0.45 |
+| Google Batch API | Gemini 3 Flash | Dreamer batch | $0.25 | $1.50 |
 
-Estimated cost per user message: ~$0.00017 (Deriver) + negligible retrieval = **well under $0.001/message**
+**Extractor upgrade options** (if V3.2 extraction quality is insufficient):
+
+| Provider | Model | Input $/M | Output $/M | Notes |
+|----------|-------|-----------|------------|-------|
+| NousResearch | Qwen 3.5 | $0.44 | $2.62 | Best value step-up |
+| NousResearch | Kimi K2.5 | $0.50 | $2.40 | Comparable reasoning |
+| NousResearch | MiniMax M2.5 | $0.33 | $1.30 | Minimal cost increase |
+
+Estimated cost per user message: ~$0.00052 (Deriver) + negligible retrieval = **well under $0.001/message**
+
+---
+
+## Gemini Batch API integration (Dreamer)
+
+The Dreamer runs asynchronously as a background process and is the perfect fit for Google's Batch API, which processes requests at **50% of standard pricing** with a 24-hour SLO (most jobs complete much faster).
+
+### Why batch for the Dreamer
+
+The Dreamer wakes up periodically (hours/days between cycles), processes accumulated notes in bulk, and has no latency requirements. Batch API eliminates the need for client-side rate limiting, retry logic, and request queuing — Google handles all of that.
+
+### SDK and authentication
+
+```bash
+pip install google-genai
+```
+
+Requires a Gemini API key (free tier available, paid tier for production). Set via environment variable:
+```bash
+export GEMINI_API_KEY=your_key_here
+```
+
+### Submitting Dreamer jobs (inline requests for small batches)
+
+For typical Dreamer cycles processing tens of notes, use inline requests (< 20MB total):
+
+```python
+from google import genai
+
+client = genai.Client()
+
+# Build one request per Dreamer task (link generation, pattern detection, etc.)
+dreamer_requests = [
+    {
+        "contents": [{
+            "parts": [{"text": dreamer_prompt_for_notes}],
+            "role": "user"
+        }],
+        "system_instruction": {"parts": [{"text": DREAMER_SYSTEM_PROMPT}]},
+        "generation_config": {
+            "temperature": 0.3,
+            "response_mime_type": "application/json"
+        }
+    }
+    for dreamer_prompt_for_notes in build_dreamer_prompts(pending_notes)
+]
+
+batch_job = client.batches.create(
+    model="gemini-3-flash-preview",
+    src=dreamer_requests,
+    config={"display_name": f"dreamer-cycle-{cycle_id}"},
+)
+```
+
+### Submitting Dreamer jobs (JSONL file for large batches)
+
+For large accumulated buffers (100+ notes), use file-based input:
+
+```python
+import json
+from google.genai import types
+
+# Write JSONL file
+with open("dreamer_batch.jsonl", "w") as f:
+    for i, prompt in enumerate(build_dreamer_prompts(pending_notes)):
+        entry = {
+            "key": f"dreamer-{cycle_id}-{i}",
+            "request": {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "system_instruction": {"parts": [{"text": DREAMER_SYSTEM_PROMPT}]},
+                "generation_config": {"temperature": 0.3, "response_mime_type": "application/json"}
+            }
+        }
+        f.write(json.dumps(entry) + "\n")
+
+# Upload via File API
+uploaded = client.files.upload(
+    file="dreamer_batch.jsonl",
+    config=types.UploadFileConfig(display_name=f"dreamer-{cycle_id}", mime_type="jsonl")
+)
+
+# Submit batch
+batch_job = client.batches.create(
+    model="gemini-3-flash-preview",
+    src=uploaded,
+    config={"display_name": f"dreamer-cycle-{cycle_id}"},
+)
+```
+
+### Polling for completion
+
+```python
+import time
+
+completed_states = {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}
+
+while True:
+    job = client.batches.get(name=batch_job.name)
+    state = job.state.name if hasattr(job.state, "name") else str(job.state)
+
+    if state in completed_states:
+        break
+    time.sleep(30)  # poll every 30s to avoid rate limits
+
+if state == "JOB_STATE_SUCCEEDED":
+    # Inline results
+    if hasattr(job.dest, "inlined_responses") and job.dest.inlined_responses:
+        for response in job.dest.inlined_responses:
+            process_dreamer_output(response)
+    # File-based results
+    elif hasattr(job.dest, "file_name"):
+        content = client.files.download(file=job.dest.file_name)
+        for line in content.decode().strip().split("\n"):
+            result = json.loads(line)
+            process_dreamer_output(result)
+```
+
+### Job states
+
+| State | Meaning |
+|-------|---------|
+| `JOB_STATE_PENDING` | Created, waiting to be processed |
+| `JOB_STATE_RUNNING` | In progress |
+| `JOB_STATE_SUCCEEDED` | Complete — retrieve results |
+| `JOB_STATE_FAILED` | Failed — check error details |
+| `JOB_STATE_CANCELLED` | Cancelled by user |
+| `JOB_STATE_EXPIRED` | Ran/pending > 48 hours — resubmit |
+
+### Key constraints
+
+- **Max input file size**: 2 GB
+- **Max inline request size**: 20 MB total
+- **Target SLO**: 24 hours (most jobs finish much faster)
+- **Pricing**: 50% of standard Gemini 3 Flash rates → **$0.25/M input, $1.50/M output**
+- **Context caching**: supported in batch — repeated system prompts across requests may get cache hits at 10% of input price
+- **Structured output**: use `response_mime_type: "application/json"` with optional `response_schema` for typed Dreamer outputs
+- **No idempotency**: submitting the same request twice creates two separate jobs — track job names in SQLite
 
 ---
 
@@ -282,8 +430,8 @@ Both should use ONNX Runtime with INT8 quantization for ~3× CPU speedup.
 - Zvec collection creation and basic insert/query
 
 ### Phase 2 — Write pipeline
-- Deriver Call 1 (Extractor) via DeepSeek API
-- Deriver Call 2 (Scorer) via DeepSeek V3
+- Deriver Call 1 (Extractor) via NousResearch DeepSeek V3.2
+- Deriver Call 2 (Scorer) via NousResearch DeepSeek V3.2
 - Async task queue (SQLite-based)
 - Raw notes → SQLite + FTS5 + Zvec simultaneously
 - Provenance tagging, durability classification, emotional weight
@@ -303,7 +451,7 @@ Both should use ONNX Runtime with INT8 quantization for ~3× CPU speedup.
 
 ### Phase 5 — Background processes
 - Batch dedup (clustering + merge + importance scoring)
-- Dreamer (pattern detection, contradiction check, profile updates)
+- Dreamer via Gemini 3 Flash Batch API (pattern detection, contradiction check, profile updates)
 - MAGMA multi-graph (entity, temporal, causal)
 
 ### Phase 6 — Refinement
@@ -374,35 +522,40 @@ Before starting implementation, familiarize yourself with these resources in pri
 8. **MAGMA paper** — Our multi-graph secondary storage design. Understand the four orthogonal graphs (semantic, temporal, causal, entity) and the fast-path/slow-path separation.
    - arxiv.org/abs/2601.03236 (paper)
 
+9. **Gemini Batch API** — Our Dreamer inference backend. Understand the JSONL file format, job lifecycle (create → poll → retrieve), inline vs file-based submission, and structured output with `response_mime_type`.
+   - ai.google.dev/gemini-api/docs/batch-api (official docs, Python/JS/REST examples)
+   - ai.google.dev/gemini-api/docs/pricing (50% batch discount details)
+   - developers.googleblog.com/en/scale-your-ai-workloads-batch-mode-gemini-api/ (architecture overview)
+
 ### Good to know (context and alternatives)
 
-9. **Ebbinghaus decay implementations** — Understand the forgetting curve formula and how it's been applied to AI memory.
-   - dev.to/sachit_mishra — "I built memory decay for AI agents using the Ebbinghaus forgetting curve"
-   - YourMemory MCP Server — importance-weighted decay formula we adapted
-   - news.ycombinator.com/item?id=47070979 — Kore memory layer discussion
+10. **Ebbinghaus decay implementations** — Understand the forgetting curve formula and how it's been applied to AI memory.
+    - dev.to/sachit_mishra — "I built memory decay for AI agents using the Ebbinghaus forgetting curve"
+    - YourMemory MCP Server — importance-weighted decay formula we adapted
+    - news.ycombinator.com/item?id=47070979 — Kore memory layer discussion
 
-10. **Matryoshka embeddings** — If fine-tuning the embedding model later. Understand how MRL trains multi-resolution embeddings and the MatryoshkaLoss in sentence-transformers.
+11. **Matryoshka embeddings** — If fine-tuning the embedding model later. Understand how MRL trains multi-resolution embeddings and the MatryoshkaLoss in sentence-transformers.
     - sbert.net/examples/sentence_transformer/training/matryoshka/README.html
     - arxiv.org/abs/2205.13147 (original MRL paper)
 
-11. **Anti-sycophancy research** — Context for why our provenance tracking matters.
+12. **Anti-sycophancy research** — Context for why our provenance tracking matters.
     - news.mit.edu/2026/personalization-features-can-make-llms-more-agreeable-0218 (the key study)
     - arxiv.org/abs/2503.03704 (MINJA memory injection attacks — why provenance tracking is also a security measure)
 
-12. **Commercial memory implementations** — Context for what we're improving upon.
+13. **Commercial memory implementations** — Context for what we're improving upon.
     - llmrefs.com/blog/reverse-engineering-chatgpt-memory (ChatGPT memory reverse-engineered)
     - simonwillison.net/2025/Sep/12/claude-memory/ (Claude vs ChatGPT memory comparison)
     - shloked.com/writing/gemini-memory (Gemini's deliberate restraint)
 
-13. **Mem0 architecture** — The most popular open-source alternative. Understand what it does (ADD/UPDATE/DELETE/NOOP per fact, graph memory via Neo4j) and where it falls short (49% on LongMemEval, 3 LLM calls per write, 18% Recall@5).
+14. **Mem0 architecture** — The most popular open-source alternative. Understand what it does (ADD/UPDATE/DELETE/NOOP per fact, graph memory via Neo4j) and where it falls short (49% on LongMemEval, 3 LLM calls per write, 18% Recall@5).
     - deepwiki.com/mem0ai/mem0 (architecture overview)
     - arxiv.org/abs/2504.19413 (Mem0 paper with benchmark results)
 
-14. **nomic-embed-text-v1.5** — Our embedding model. Understand its Matryoshka support (truncate 768→384→128→64), 8192 token context, and ONNX export for CPU speedup.
+15. **nomic-embed-text-v1.5** — Our embedding model. Understand its Matryoshka support (truncate 768→384→128→64), 8192 token context, and ONNX export for CPU speedup.
     - huggingface.co/nomic-ai/nomic-embed-text-v1.5
     - nomic.ai/news/nomic-embed-matryoshka
 
-15. **SimpleMem** — An alternative approach worth understanding: front-loads work at ingestion via semantic compression, achieving strong results with only 531 tokens/query.
+16. **SimpleMem** — An alternative approach worth understanding: front-loads work at ingestion via semantic compression, achieving strong results with only 531 tokens/query.
     - arxiv.org/abs/2601.02553
 
 ### Libraries and tools to install
@@ -421,7 +574,8 @@ pip install onnxruntime  # for 3x CPU speedup
 pip install networkx
 
 # API clients
-pip install httpx  # for DeepSeek API calls
+pip install httpx  # for NousResearch API calls (OpenAI-compatible)
+pip install google-genai  # for Gemini Batch API (Dreamer)
 
 # Web framework (if exposing as API)
 pip install fastapi uvicorn
