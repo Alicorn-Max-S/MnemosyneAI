@@ -352,10 +352,27 @@ class TestTaskQueue:
         assert completed.status == "completed"
         assert completed.completed_at is not None
 
-    async def test_fail(self, store):
-        await store.enqueue_task("embed")
+    async def test_fail_retryable(self, store):
+        await store.enqueue_task("embed", max_attempts=3)
         task = await store.dequeue_task("embed")
+        assert task.attempts == 1
         failed = await store.fail_task(task.id, "Something went wrong")
-        assert failed.status == "failed"
+        assert failed.status == "pending"
         assert failed.error == "Something went wrong"
-        assert failed.completed_at is not None
+        assert failed.completed_at is None
+
+    async def test_dead_letter(self, store):
+        await store.enqueue_task("embed", max_attempts=2)
+        # First attempt: dequeue (attempts=1) then fail -> retryable
+        task = await store.dequeue_task("embed")
+        assert task.attempts == 1
+        result = await store.fail_task(task.id, "error 1")
+        assert result.status == "pending"
+
+        # Second attempt: dequeue (attempts=2) then fail -> dead_letter
+        task = await store.dequeue_task("embed")
+        assert task.attempts == 2
+        result = await store.fail_task(task.id, "error 2")
+        assert result.status == "dead_letter"
+        assert result.error == "error 2"
+        assert result.completed_at is not None

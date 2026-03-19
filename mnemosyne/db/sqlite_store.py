@@ -343,11 +343,13 @@ class SQLiteStore:
     ) -> list[Message]:
         """Get the most recent n messages from a session."""
         cursor = await self._db.execute(
-            """SELECT * FROM (
-                   SELECT * FROM messages WHERE session_id = ?
-                   ORDER BY created_at DESC LIMIT ?
-               ) ORDER BY created_at""",
-            (session_id, n_turns),
+            """SELECT * FROM messages
+               WHERE session_id = ? AND rowid IN (
+                   SELECT rowid FROM messages WHERE session_id = ?
+                   ORDER BY rowid DESC LIMIT ?
+               )
+               ORDER BY rowid""",
+            (session_id, session_id, n_turns),
         )
         rows = await cursor.fetchall()
         return [Message.from_row(dict(r)) for r in rows]
@@ -576,12 +578,22 @@ class SQLiteStore:
         return TaskItem.from_row(dict(row))
 
     async def fail_task(self, task_id: str, error: str) -> TaskItem | None:
-        """Mark a task as failed with an error message."""
+        """Fail a task: retry if attempts < max_attempts, otherwise dead_letter."""
         await self._db.execute(
             """UPDATE task_queue
-               SET status = 'failed',
-                   error = ?,
-                   completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               SET error = ?,
+                   status = CASE
+                       WHEN attempts >= max_attempts THEN 'dead_letter'
+                       ELSE 'pending'
+                   END,
+                   started_at = CASE
+                       WHEN attempts >= max_attempts THEN started_at
+                       ELSE NULL
+                   END,
+                   completed_at = CASE
+                       WHEN attempts >= max_attempts THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       ELSE NULL
+                   END
                WHERE id = ?""",
             (error, task_id),
         )

@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 *.db
 data/
+.api_key
