@@ -154,3 +154,16 @@ class TaskItem(BaseModel):
         if isinstance(data.get("payload"), str):
             data["payload"] = json.loads(data["payload"])
         return cls(**data)
+
+
+class RetrievalResult(BaseModel):
+    """A scored retrieval result with full scoring breakdown."""
+
+    note: Note
+    score: float
+    rrf_score: float
+    decay_strength: float
+    provenance_weight: float
+    fatigue_factor: float
+    inference_discount: float
+    source: str

@@ -38,3 +38,25 @@ DERIVER_SCORE_TEMPERATURE = 0.1
 DERIVER_MAX_RETRIES = 3
 DERIVER_RETRY_DELAYS = [1.0, 2.0, 4.0]
 WORKER_POLL_INTERVAL = 2.0
+
+# Phase 3: Retrieval scoring
+DECAY_LAMBDA_BASE = 0.1
+DECAY_IMPORTANCE_FACTOR = 0.8
+DECAY_ACCESS_BOOST = 0.15
+DECAY_MEMORY_THRESHOLD = 100        # disabled below this count
+DECAY_RAMP_MAX = 1000               # full effect at this count
+DECAY_HIGH_IMPORTANCE_THRESHOLD = 0.7
+DECAY_HIGH_IMPORTANCE_FLOOR = 0.3
+
+PROVENANCE_WEIGHTS = {
+    "organic": 1.0,
+    "user_confirmed": 0.8,
+    "agent_prompted": 0.5,
+    "inferred": 0.3,
+}
+
+SURFACING_FATIGUE_RATE = 0.1
+
+INFERENCE_DISCOUNT = 0.7            # inferences weighted lower than observations
+
+MMR_SIMILARITY_THRESHOLD = 0.90

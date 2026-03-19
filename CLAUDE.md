@@ -19,9 +19,10 @@ Hostinger VPS: 4 vCPU, 16GB RAM, Ubuntu 24.04, Docker. CPU-only — no GPU.
 - `tests/` — pytest test suite
 
 ## Commands
-- Install: `pip install -e ".[dev]"`
-- Test: `pytest tests/ -v`
-- Test single file: `pytest tests/test_sqlite_store.py -v`
+- Use `python3` (not `python`) to run all commands.
+- Install: `python3 -m pip install -e ".[dev]"`
+- Test: `python3 -m pytest tests/ -v`
+- Test single file: `python3 -m pytest tests/test_sqlite_store.py -v`
 
 ## Code Standards
 - Type hints on every function signature and return type. Use `str | None` not `Optional[str]`.

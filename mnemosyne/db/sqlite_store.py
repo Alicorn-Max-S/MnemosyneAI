@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import datetime, timezone
 
 import aiosqlite
 
@@ -9,6 +10,16 @@ from mnemosyne.models import Link, Message, Note, Peer, Session, TaskItem
 from mnemosyne.utils.ids import generate_id
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> str:
+    """Return current UTC timestamp as ISO-8601 string with microsecond precision.
+
+    SQLite DEFAULT columns use strftime('%f') which only has millisecond
+    precision.  This helper provides microsecond precision so that UPDATE
+    timestamps are always distinguishable from the INSERT defaults.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class SQLiteStore:
@@ -238,7 +249,8 @@ class SQLiteStore:
             values.append(value)
 
         if "static_profile" in kwargs:
-            sets.append("profile_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+            sets.append("profile_updated_at = ?")
+            values.append(_utcnow())
 
         values.append(peer_id)
         sql = f"UPDATE peers SET {', '.join(sets)} WHERE id = ?"
@@ -284,9 +296,9 @@ class SQLiteStore:
         """End a session by setting ended_at."""
         await self._db.execute(
             """UPDATE sessions
-               SET ended_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), summary = ?
+               SET ended_at = ?, summary = ?
                WHERE id = ?""",
-            (summary, session_id),
+            (_utcnow(), summary, session_id),
         )
         await self._db.commit()
         return await self.get_session(session_id)
@@ -421,7 +433,8 @@ class SQLiteStore:
             sets.append(f"{key} = ?")
             values.append(value)
 
-        sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        sets.append("updated_at = ?")
+        values.append(_utcnow())
         values.append(note_id)
         sql = f"UPDATE notes SET {', '.join(sets)} WHERE id = ?"
         await self._db.execute(sql, values)
@@ -468,6 +481,60 @@ class SQLiteStore:
         )
         rows = await cursor.fetchall()
         return [Note.from_row(dict(r)) for r in rows]
+
+    async def fts_search_ranked(
+        self, query: str, peer_id: str, limit: int = 30
+    ) -> list[str]:
+        """Full-text search returning note IDs in BM25 rank order."""
+        cursor = await self._db.execute(
+            """SELECT notes.id
+               FROM notes_fts
+               JOIN notes ON notes.rowid = notes_fts.rowid
+               WHERE notes_fts MATCH ? AND notes.peer_id = ?
+               ORDER BY -rank DESC
+               LIMIT ?""",
+            (query, peer_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [row["id"] for row in rows]
+
+    async def get_notes_by_ids(self, note_ids: list[str]) -> dict[str, Note]:
+        """Batch fetch notes by IDs. Missing IDs are silently omitted."""
+        if not note_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in note_ids)
+        cursor = await self._db.execute(
+            f"SELECT * FROM notes WHERE id IN ({placeholders})",
+            note_ids,
+        )
+        rows = await cursor.fetchall()
+        return {row["id"]: Note.from_row(dict(row)) for row in rows}
+
+    async def record_access(self, note_ids: list[str]) -> None:
+        """Batch update access_count, times_surfaced, last_accessed_at for given IDs."""
+        if not note_ids:
+            return
+        placeholders = ", ".join("?" for _ in note_ids)
+        now = _utcnow()
+        await self._db.execute(
+            f"""UPDATE notes
+                SET access_count = access_count + 1,
+                    times_surfaced = times_surfaced + 1,
+                    last_accessed_at = ?,
+                    updated_at = ?
+                WHERE id IN ({placeholders})""",
+            [now, now, *note_ids],
+        )
+        await self._db.commit()
+
+    async def count_notes(self, peer_id: str) -> int:
+        """Count total notes for a peer."""
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM notes WHERE peer_id = ?",
+            (peer_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0]
 
     # ── Links ───────────────────────────────────────────────────────
 
@@ -542,7 +609,7 @@ class SQLiteStore:
         cursor = await self._db.execute(
             """UPDATE task_queue
                SET status = 'processing',
-                   started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                   started_at = ?,
                    attempts = attempts + 1
                WHERE id = (
                    SELECT id FROM task_queue
@@ -551,7 +618,7 @@ class SQLiteStore:
                    LIMIT 1
                )
                RETURNING *""",
-            (task_type,),
+            (_utcnow(), task_type),
         )
         row = await cursor.fetchone()
         await self._db.commit()
@@ -564,9 +631,9 @@ class SQLiteStore:
         await self._db.execute(
             """UPDATE task_queue
                SET status = 'completed',
-                   completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                   completed_at = ?
                WHERE id = ?""",
-            (task_id,),
+            (_utcnow(), task_id),
         )
         await self._db.commit()
         cursor = await self._db.execute(
@@ -579,6 +646,7 @@ class SQLiteStore:
 
     async def fail_task(self, task_id: str, error: str) -> TaskItem | None:
         """Fail a task: retry if attempts < max_attempts, otherwise dead_letter."""
+        now = _utcnow()
         await self._db.execute(
             """UPDATE task_queue
                SET error = ?,
@@ -591,11 +659,11 @@ class SQLiteStore:
                        ELSE NULL
                    END,
                    completed_at = CASE
-                       WHEN attempts >= max_attempts THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       WHEN attempts >= max_attempts THEN ?
                        ELSE NULL
                    END
                WHERE id = ?""",
-            (error, task_id),
+            (error, now, task_id),
         )
         await self._db.commit()
         cursor = await self._db.execute(

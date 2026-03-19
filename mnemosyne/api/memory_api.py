@@ -7,7 +7,8 @@ import re
 
 from mnemosyne.config import DEFAULT_DATA_DIR, RRF_K, SQLITE_DB_NAME
 from mnemosyne.db.sqlite_store import SQLiteStore
-from mnemosyne.models import Message, Note, Peer, Session
+from mnemosyne.models import Message, Note, Peer, RetrievalResult, Session
+from mnemosyne.retrieval import create_retriever
 from mnemosyne.vectors.embedder import Embedder
 from mnemosyne.vectors.zvec_store import ZvecStore
 
@@ -27,6 +28,7 @@ class MemoryAPI:
         self._sqlite: SQLiteStore | None = None
         self._zvec: ZvecStore | None = None
         self._embedder: Embedder | None = embedder
+        self._retriever = None
 
     async def initialize(self) -> None:
         """Create stores, load embedder if not injected, and prepare for use."""
@@ -39,6 +41,7 @@ class MemoryAPI:
             self._embedder = await asyncio.to_thread(Embedder)
 
         self._zvec = await asyncio.to_thread(ZvecStore, self.data_dir)
+        self._retriever = create_retriever(self._sqlite, self._zvec, self._embedder)
         logger.info("MemoryAPI initialized at %s", self.data_dir)
 
     async def close(self) -> None:
@@ -48,6 +51,7 @@ class MemoryAPI:
         self._sqlite = None
         self._zvec = None
         self._embedder = None
+        self._retriever = None
 
     # ── Delegated CRUD ─────────────────────────────────────────────
 
@@ -124,6 +128,14 @@ class MemoryAPI:
         note = await self._sqlite.update_note(note.id, zvec_id=note.id)
         logger.info("Added note %s for peer %s", note.id, peer_id)
         return note
+
+    # ── Retrieval (Phase 3) ──────────────────────────────────────
+
+    async def retrieve(
+        self, query: str, peer_id: str, limit: int = 10
+    ) -> list[RetrievalResult]:
+        """Run the full retrieval pipeline with scoring and dedup."""
+        return await self._retriever.retrieve(query, peer_id, limit=limit)
 
     # ── Search ─────────────────────────────────────────────────────
 
