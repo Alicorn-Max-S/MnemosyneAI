@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
-from mnemosyne.models import Link, Message, Note, Peer, Session, TaskItem
+from mnemosyne.models import Link, Message, Note, Peer, PeerProfile, Session, TaskItem
 from mnemosyne.utils.ids import generate_id
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,14 @@ class SQLiteStore:
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 started_at TEXT,
                 completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS peer_profiles (
+                peer_id TEXT PRIMARY KEY REFERENCES peers(id),
+                sections TEXT NOT NULL DEFAULT '{}',
+                fact_count INTEGER NOT NULL DEFAULT 0,
+                generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                source_note_ids TEXT NOT NULL DEFAULT '[]'
             );
         """)
 
@@ -580,6 +588,62 @@ class SQLiteStore:
         await self._db.commit()
         return cursor.rowcount > 0
 
+    async def get_linked_notes(
+        self, note_ids: list[str], depth: int = 1, max_per_seed: int = 5
+    ) -> list[Note]:
+        """Get notes linked to the given seed IDs, excluding the seeds themselves.
+
+        Traverses the link graph up to `depth` hops, returning at most
+        `max_per_seed` neighbors per seed note. Results are deduplicated.
+        """
+        if not note_ids:
+            return []
+
+        seen_ids = set(note_ids)
+        frontier = list(note_ids)
+        all_neighbor_ids: set[str] = set()
+
+        for _ in range(depth):
+            if not frontier:
+                break
+
+            placeholders = ", ".join("?" for _ in frontier)
+            cursor = await self._db.execute(
+                f"""SELECT source_note_id, target_note_id
+                    FROM links
+                    WHERE source_note_id IN ({placeholders})
+                       OR target_note_id IN ({placeholders})""",
+                frontier + frontier,
+            )
+            rows = await cursor.fetchall()
+
+            # Group neighbors by seed, cap per seed
+            seed_set = set(frontier)
+            seed_neighbors: dict[str, list[str]] = {sid: [] for sid in frontier}
+            for row in rows:
+                src, tgt = row["source_note_id"], row["target_note_id"]
+                if src in seed_set and tgt not in seen_ids:
+                    if len(seed_neighbors[src]) < max_per_seed:
+                        seed_neighbors[src].append(tgt)
+                if tgt in seed_set and src not in seen_ids:
+                    if len(seed_neighbors[tgt]) < max_per_seed:
+                        seed_neighbors[tgt].append(src)
+
+            next_frontier: list[str] = []
+            for neighbors in seed_neighbors.values():
+                for nid in neighbors:
+                    if nid not in seen_ids:
+                        seen_ids.add(nid)
+                        all_neighbor_ids.add(nid)
+                        next_frontier.append(nid)
+            frontier = next_frontier
+
+        if not all_neighbor_ids:
+            return []
+
+        notes_map = await self.get_notes_by_ids(list(all_neighbor_ids))
+        return list(notes_map.values())
+
     # ── Task Queue ──────────────────────────────────────────────────
 
     async def enqueue_task(
@@ -696,3 +760,53 @@ class SQLiteStore:
             score = row_dict.pop("score")
             results.append((Note.from_row(row_dict), score))
         return results
+
+    # ── Profiles ─────────────────────────────────────────────────
+
+    async def upsert_profile(
+        self,
+        peer_id: str,
+        sections: dict,
+        fact_count: int,
+        source_note_ids: list[str],
+    ) -> PeerProfile:
+        """Insert or replace a peer profile."""
+        now = _utcnow()
+        await self._db.execute(
+            """INSERT OR REPLACE INTO peer_profiles
+               (peer_id, sections, fact_count, generated_at, source_note_ids)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                peer_id,
+                json.dumps(sections),
+                fact_count,
+                now,
+                json.dumps(source_note_ids),
+            ),
+        )
+        await self._db.commit()
+        return await self.get_profile(peer_id)
+
+    async def get_profile(self, peer_id: str) -> PeerProfile | None:
+        """Fetch the profile for a peer."""
+        cursor = await self._db.execute(
+            "SELECT * FROM peer_profiles WHERE peer_id = ?", (peer_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return PeerProfile.from_row(dict(row))
+
+    async def get_permanent_notes(
+        self, peer_id: str, limit: int = 50
+    ) -> list[Note]:
+        """Get permanent notes for a peer, sorted by importance DESC."""
+        cursor = await self._db.execute(
+            """SELECT * FROM notes
+               WHERE peer_id = ? AND durability = 'permanent'
+               ORDER BY importance DESC, created_at DESC
+               LIMIT ?""",
+            (peer_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [Note.from_row(dict(r)) for r in rows]

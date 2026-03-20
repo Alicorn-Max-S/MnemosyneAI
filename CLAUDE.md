@@ -16,6 +16,7 @@ Hostinger VPS: 4 vCPU, 16GB RAM, Ubuntu 24.04, Docker. CPU-only — no GPU.
 - `mnemosyne/api/` — high-level MemoryAPI coordinating SQLite + Zvec
 - `mnemosyne/models.py` — Pydantic data models
 - `mnemosyne/config.py` — all constants and configuration
+- `mnemosyne/intelligence/` — ColBERT reranker, A-MEM linker, static profiler
 - `tests/` — pytest test suite
 
 ## Commands
@@ -23,6 +24,7 @@ Hostinger VPS: 4 vCPU, 16GB RAM, Ubuntu 24.04, Docker. CPU-only — no GPU.
 - Install: `python3 -m pip install -e ".[dev]"`
 - Test: `python3 -m pytest tests/ -v`
 - Test single file: `python3 -m pytest tests/test_sqlite_store.py -v`
+- Phase 4 tests: `python3 -m pytest tests/test_reranker.py tests/test_linker.py tests/test_profiler.py tests/test_link_expansion.py tests/test_intelligence_pipeline.py -v`
 
 ## Code Standards
 - Type hints on every function signature and return type. Use `str | None` not `Optional[str]`.
@@ -85,6 +87,12 @@ collection.delete(ids="note_abc")
 from ulid import ULID
 new_id = str(ULID())  # e.g. "01HASFKBN8SKZTSVVS03K5AMMS"
 ```
+
+### rerankers (ColBERT)
+- Model: answerdotai/answerai-colbert-small-v1 (~130MB, 33M params)
+- Load once: `Reranker(model_name, model_type="colbert")`
+- Graceful fallback if model fails to load
+- `[transformers]` extra required for local inference
 
 ### aiosqlite
 ```python

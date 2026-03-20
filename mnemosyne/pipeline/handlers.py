@@ -19,11 +19,13 @@ async def handle_derive(
     deriver: Deriver,
     embedder: Embedder,
     zvec: ZvecStore,
+    linker=None,
 ) -> None:
     """Extract, score, embed, and persist notes from a user message.
 
     Reads message data from task.payload, runs the Deriver extract/score
     pipeline, embeds each scored note, and writes to SQLite + Zvec.
+    If a linker is provided, generates semantic links for each new note.
     """
     payload = task.payload
     message_id = payload["message_id"]
@@ -54,11 +56,15 @@ async def handle_derive(
         )
         return
 
-    # Persist each scored note
-    created = 0
-    for note in scored_notes:
-        embedding = await asyncio.to_thread(embedder.embed_document, note["text"])
+    # Batch-embed all texts at once (faster per-text than individual calls)
+    texts = [note["text"] for note in scored_notes]
+    embeddings = await asyncio.to_thread(embedder.embed_documents, texts)
 
+    # Create notes in SQLite and collect Zvec items
+    zvec_items: list[tuple[str, list[float]]] = []
+    note_objs: list[tuple] = []
+    created = 0
+    for note, embedding in zip(scored_notes, embeddings):
         note_obj = await db.create_note(
             peer_id,
             content=note["text"],
@@ -73,17 +79,29 @@ async def handle_derive(
             context_description=note.get("context_description"),
             is_buffered=True,
         )
+        zvec_items.append((note_obj.id, embedding))
+        note_objs.append((note_obj, embedding))
+        created += 1
 
+    # Batch insert to Zvec (single HNSW optimize instead of per-note)
+    if zvec_items:
         try:
-            await asyncio.to_thread(zvec.insert, note_obj.id, embedding)
-            await db.update_note(note_obj.id, zvec_id=note_obj.id)
+            await asyncio.to_thread(zvec.insert_batch, zvec_items)
+            for note_id, _ in zvec_items:
+                await db.update_note(note_id, zvec_id=note_id)
         except Exception:
             logger.warning(
-                "Zvec insert failed for note %s, skipping vector index",
-                note_obj.id,
+                "Zvec batch insert failed for %d notes, skipping vector index",
+                len(zvec_items),
             )
 
-        created += 1
+    # Generate semantic links for each new note
+    if linker is not None:
+        for note_obj, embedding in note_objs:
+            try:
+                await linker.generate_links(note_obj, embedding)
+            except Exception:
+                logger.warning("Link generation failed for note %s", note_obj.id)
 
     t_persist = time.monotonic()
     logger.info(

@@ -3,6 +3,6 @@
 from mnemosyne.retrieval.retriever import Retriever
 
 
-def create_retriever(sqlite_store, zvec_store, embedder) -> Retriever:
+def create_retriever(sqlite_store, zvec_store, embedder, colbert_reranker=None) -> Retriever:
     """Factory to create a Retriever wired to the given stores."""
-    return Retriever(sqlite_store, zvec_store, embedder)
+    return Retriever(sqlite_store, zvec_store, embedder, colbert_reranker=colbert_reranker)

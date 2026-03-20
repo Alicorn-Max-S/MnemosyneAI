@@ -70,3 +70,47 @@ def mmr_dedup(
             selected_embeddings.append(candidate)
 
     return selected
+
+
+def content_dedup(
+    scored_ids: list[str],
+    contents: dict[str, str],
+    threshold: float = 0.80,
+) -> list[str]:
+    """Fast near-duplicate removal using token overlap.
+
+    Approximates cosine similarity > 0.90 by checking Jaccard word overlap.
+    No embedding computation required — runs in microseconds.
+
+    Walks scored_ids in order (assumed pre-sorted by score descending).
+    IDs without content are auto-accepted.
+
+    Returns filtered list preserving insertion order.
+    """
+    selected: list[str] = []
+    selected_tokens: list[set[str]] = []
+
+    for item_id in scored_ids:
+        text = contents.get(item_id)
+        if text is None:
+            selected.append(item_id)
+            continue
+
+        tokens = set(text.lower().split())
+        if not tokens:
+            selected.append(item_id)
+            continue
+
+        is_dup = False
+        for sel_tokens in selected_tokens:
+            intersection = len(tokens & sel_tokens)
+            union = len(tokens | sel_tokens)
+            if union > 0 and intersection / union > threshold:
+                is_dup = True
+                break
+
+        if not is_dup:
+            selected.append(item_id)
+            selected_tokens.append(tokens)
+
+    return selected

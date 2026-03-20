@@ -159,15 +159,15 @@ class TestWritePipeline:
             ]
         )
 
-        # Monkey-patch zvec.insert to always raise
-        original_insert = zvec.insert
-        zvec.insert = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("zvec boom"))
+        # Monkey-patch zvec.insert_batch to always raise (handler uses batch insert)
+        original_insert_batch = zvec.insert_batch
+        zvec.insert_batch = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("zvec boom"))
 
         await ingest_message(session.id, peer.id, "user", "Buddy the dog", db=store)
         worker = create_worker(store, deriver, embedder, zvec)
         await worker.run_once()
 
-        zvec.insert = original_insert
+        zvec.insert_batch = original_insert_batch
 
         notes = await store.list_notes(peer.id)
         assert len(notes) == 2

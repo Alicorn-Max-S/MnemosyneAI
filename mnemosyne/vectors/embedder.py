@@ -84,17 +84,17 @@ class Embedder:
     def embed_document(self, text: str) -> list[float]:
         """Embed a single document text with the document prefix."""
         prefixed = f"{EMBEDDING_DOC_PREFIX}{text}"
-        vector = self._model.encode(prefixed)
+        vector = self._model.encode(prefixed, normalize_embeddings=True)
         return vector.tolist()
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed multiple document texts with the document prefix."""
         prefixed = [f"{EMBEDDING_DOC_PREFIX}{t}" for t in texts]
-        vectors = self._model.encode(prefixed)
+        vectors = self._model.encode(prefixed, normalize_embeddings=True)
         return vectors.tolist()
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a query text with the query prefix."""
         prefixed = f"{EMBEDDING_QUERY_PREFIX}{query}"
-        vector = self._model.encode(prefixed)
+        vector = self._model.encode(prefixed, normalize_embeddings=True)
         return vector.tolist()

@@ -132,6 +132,26 @@ class Link(BaseModel):
         return cls(**data)
 
 
+class PeerProfile(BaseModel):
+    """A static profile (Peer Card) generated from permanent notes."""
+
+    peer_id: str
+    sections: dict[str, str]
+    fact_count: int
+    generated_at: str
+    source_note_ids: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_row(cls, row: dict) -> "PeerProfile":
+        """Construct from an aiosqlite Row dict."""
+        data = dict(row)
+        if isinstance(data.get("sections"), str):
+            data["sections"] = json.loads(data["sections"])
+        if isinstance(data.get("source_note_ids"), str):
+            data["source_note_ids"] = json.loads(data["source_note_ids"])
+        return cls(**data)
+
+
 class TaskItem(BaseModel):
     """A task in the background processing queue."""
 
@@ -161,9 +181,11 @@ class RetrievalResult(BaseModel):
 
     note: Note
     score: float
+    composite_score: float = 0.0
     rrf_score: float
     decay_strength: float
     provenance_weight: float
     fatigue_factor: float
     inference_discount: float
+    colbert_score: float | None = None
     source: str
