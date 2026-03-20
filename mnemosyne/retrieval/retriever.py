@@ -1,10 +1,19 @@
-"""8-step retrieval pipeline for Mnemosyne."""
+"""8-step retrieval pipeline for Mnemosyne with link expansion and ColBERT reranking."""
 
 import asyncio
 import logging
 import re
 from datetime import datetime, timezone
 
+from mnemosyne.config import (
+    COLBERT_RERANK_CANDIDATES,
+    COLBERT_TOP_N,
+    LINK_EXPANSION_DEPTH,
+    LINK_EXPANSION_MAX,
+    LINK_EXPANSION_TOP_SEEDS,
+    RETRIEVAL_FTS_LIMIT,
+    RETRIEVAL_VECTOR_LIMIT,
+)
 from mnemosyne.db.sqlite_store import SQLiteStore
 from mnemosyne.models import RetrievalResult
 from mnemosyne.retrieval.fusion import mmr_dedup, rrf_fuse
@@ -20,6 +29,9 @@ from mnemosyne.vectors.zvec_store import ZvecStore
 
 logger = logging.getLogger(__name__)
 
+# Max FTS-only notes to embed on-the-fly for MMR dedup
+_MMR_EMBED_CAP = 10
+
 
 class Retriever:
     """Coordinates parallel search, fusion, scoring, MMR dedup, and access recording."""
@@ -29,11 +41,13 @@ class Retriever:
         sqlite_store: SQLiteStore,
         zvec_store: ZvecStore,
         embedder: Embedder,
+        colbert_reranker=None,
     ) -> None:
         """Initialize with store and embedder references."""
         self._db = sqlite_store
         self._zvec = zvec_store
         self._embedder = embedder
+        self._reranker = colbert_reranker
 
     @staticmethod
     def _sanitize_fts_query(query: str) -> str:
@@ -42,13 +56,46 @@ class Retriever:
         tokens = cleaned.split()
         return " ".join(tokens) if tokens else ""
 
+    async def _mmr_dedup_results(
+        self,
+        results: list[RetrievalResult],
+        vec_set: set[str],
+    ) -> list[RetrievalResult]:
+        """Apply MMR dedup using embeddings, embedding FTS-only notes on the fly."""
+        sorted_ids = [r.note.id for r in results]
+
+        # Collect embeddings: vector-sourced notes already have them in Zvec,
+        # but we need to re-embed for MMR.  Batch-embed all candidate texts,
+        # capping FTS-only notes to _MMR_EMBED_CAP to limit latency.
+        fts_only_ids = [nid for nid in sorted_ids if nid not in vec_set]
+        ids_to_embed = list(vec_set & set(sorted_ids)) + fts_only_ids[:_MMR_EMBED_CAP]
+
+        texts = []
+        id_order = []
+        result_map = {r.note.id: r for r in results}
+        for nid in ids_to_embed:
+            r = result_map.get(nid)
+            if r is not None:
+                texts.append(r.note.content)
+                id_order.append(nid)
+
+        embeddings: dict[str, list[float]] = {}
+        if texts:
+            vecs = await asyncio.to_thread(self._embedder.embed_documents, texts)
+            for nid, vec in zip(id_order, vecs):
+                embeddings[nid] = vec
+
+        deduped_ids = mmr_dedup(sorted_ids, embeddings)
+        deduped_set = set(deduped_ids)
+        return [r for r in results if r.note.id in deduped_set]
+
     async def retrieve(
         self,
         query: str,
         peer_id: str,
         limit: int = 10,
     ) -> list[RetrievalResult]:
-        """Execute the full 8-step retrieval pipeline."""
+        """Execute the full retrieval pipeline with link expansion and optional ColBERT reranking."""
         # 1. Sanitize query
         sanitized = self._sanitize_fts_query(query)
         if not sanitized:
@@ -62,7 +109,9 @@ class Retriever:
         # 3. Parallel search with graceful degradation
         async def _safe_fts_search() -> list[str]:
             try:
-                return await self._db.fts_search_ranked(sanitized, peer_id, limit=30)
+                return await self._db.fts_search_ranked(
+                    sanitized, peer_id, limit=RETRIEVAL_FTS_LIMIT
+                )
             except Exception:
                 logger.warning("FTS search failed, degrading to vector-only")
                 return []
@@ -70,7 +119,7 @@ class Retriever:
         async def _safe_vec_search() -> list[str]:
             try:
                 results = await asyncio.to_thread(
-                    self._zvec.search, query_embedding, 30
+                    self._zvec.search, query_embedding, RETRIEVAL_VECTOR_LIMIT
                 )
                 return [r["id"] for r in results]
             except Exception:
@@ -99,10 +148,7 @@ class Retriever:
             else:
                 source_map[nid] = "vector"
 
-        # 5. RRF fuse
-        rrf_scores = rrf_fuse([fts_ids, vec_ids])
-
-        # 6. Hydrate — batch fetch and filter by peer_id (Zvec has no peer filtering)
+        # 5. Hydrate — batch fetch and filter by peer_id
         notes_map = await self._db.get_notes_by_ids(all_ids)
         notes_map = {
             nid: note for nid, note in notes_map.items() if note.peer_id == peer_id
@@ -111,10 +157,42 @@ class Retriever:
         if not notes_map:
             return []
 
+        # 6. Preliminary RRF for seed selection
+        preliminary_rrf = rrf_fuse([fts_ids, vec_ids])
+        seed_candidates = sorted(
+            notes_map.keys(), key=lambda nid: preliminary_rrf.get(nid, 0.0), reverse=True
+        )
+        seed_ids = seed_candidates[:LINK_EXPANSION_TOP_SEEDS]
+
+        # 7. Link expansion via get_linked_notes()
+        link_ids: list[str] = []
+        try:
+            linked_notes = await self._db.get_linked_notes(
+                seed_ids, depth=LINK_EXPANSION_DEPTH, max_per_seed=LINK_EXPANSION_MAX
+            )
+            for note in linked_notes:
+                if note.peer_id != peer_id:
+                    continue
+                if note.id in notes_map:
+                    continue
+                notes_map[note.id] = note
+                base = source_map.get(note.id, "")
+                source_map[note.id] = f"{base}+link" if base else "link"
+                link_ids.append(note.id)
+        except Exception:
+            logger.warning("Link expansion failed, using 2-list RRF")
+            link_ids = []
+
+        # 8. Full RRF fusion with 2 or 3 lists
+        rrf_lists = [fts_ids, vec_ids]
+        if link_ids:
+            rrf_lists.append(link_ids)
+        rrf_scores = rrf_fuse(rrf_lists)
+
         # Get total memories once for decay formula
         total_memories = await self._db.count_notes(peer_id)
 
-        # 7. Composite score
+        # 9. Composite score
         now = datetime.now(timezone.utc)
         results: list[RetrievalResult] = []
         for nid, note in notes_map.items():
@@ -137,33 +215,65 @@ class Retriever:
                 RetrievalResult(
                     note=note,
                     score=composite,
+                    composite_score=composite,
                     rrf_score=rrf,
                     decay_strength=decay,
                     provenance_weight=prov,
                     fatigue_factor=fatigue,
                     inference_discount=inf_disc,
+                    colbert_score=None,
                     source=source_map.get(nid, "fts"),
                 )
             )
 
-        # 8. Sort by composite score descending
+        # 10. Sort by composite score descending
         results.sort(key=lambda r: r.score, reverse=True)
 
-        # 9. MMR dedup
-        sorted_ids = [r.note.id for r in results]
-        contents = [r.note.content for r in results]
-        embeddings_list = await asyncio.to_thread(
-            self._embedder.embed_documents, contents
-        )
-        embeddings_map = dict(zip(sorted_ids, embeddings_list))
-        deduped_ids = mmr_dedup(sorted_ids, embeddings_map)
-        deduped_set = set(deduped_ids)
-        results = [r for r in results if r.note.id in deduped_set]
+        # 11. ColBERT reranking OR MMR dedup
+        if self._reranker is not None and self._reranker.is_loaded():
+            try:
+                candidates_for_rerank = results[:COLBERT_RERANK_CANDIDATES]
+                candidate_tuples = [
+                    (r.note.id, r.note.content) for r in candidates_for_rerank
+                ]
+                reranked = await asyncio.to_thread(
+                    self._reranker.rerank, query, candidate_tuples, COLBERT_TOP_N
+                )
+                # Build lookup from rerank results
+                rerank_map = {nid: score for nid, score in reranked}
+                reranked_ids = [nid for nid, _ in reranked]
+                result_map = {r.note.id: r for r in candidates_for_rerank}
 
-        # 10. Truncate
+                reranked_results: list[RetrievalResult] = []
+                for nid in reranked_ids:
+                    r = result_map.get(nid)
+                    if r is not None:
+                        reranked_results.append(
+                            RetrievalResult(
+                                note=r.note,
+                                score=rerank_map[nid],
+                                composite_score=r.composite_score,
+                                rrf_score=r.rrf_score,
+                                decay_strength=r.decay_strength,
+                                provenance_weight=r.provenance_weight,
+                                fatigue_factor=r.fatigue_factor,
+                                inference_discount=r.inference_discount,
+                                colbert_score=rerank_map[nid],
+                                source=r.source,
+                            )
+                        )
+                results = reranked_results
+            except Exception:
+                logger.warning("ColBERT reranking failed, falling back to MMR dedup")
+                results = await self._mmr_dedup_results(results, vec_set)
+        else:
+            # Phase 3 fallback — MMR dedup
+            results = await self._mmr_dedup_results(results, vec_set)
+
+        # 12. Truncate
         results = results[:limit]
 
-        # 11. Record access
+        # 13. Record access
         returned_ids = [r.note.id for r in results]
         if returned_ids:
             await self._db.record_access(returned_ids)

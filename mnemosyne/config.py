@@ -60,3 +60,32 @@ SURFACING_FATIGUE_RATE = 0.1
 INFERENCE_DISCOUNT = 0.7            # inferences weighted lower than observations
 
 MMR_SIMILARITY_THRESHOLD = 0.90
+
+RETRIEVAL_FTS_LIMIT = 30
+RETRIEVAL_VECTOR_LIMIT = 30
+RETRIEVAL_FINAL_LIMIT = 10
+
+# --- Phase 4: Intelligence layer ---
+
+# ColBERT reranking
+COLBERT_MODEL = "answerdotai/answerai-colbert-small-v1"
+COLBERT_RERANK_CANDIDATES = 30
+COLBERT_TOP_N = 10
+
+# A-MEM link generation
+LINK_SIMILARITY_THRESHOLD = 0.75
+LINK_MAX_CANDIDATES = 10
+LINK_DEFAULT_STRENGTH = 0.5
+LINK_STRENGTH_FROM_SIMILARITY = True
+
+# Link expansion in retrieval
+LINK_EXPANSION_DEPTH = 1
+LINK_EXPANSION_MAX = 5
+LINK_EXPANSION_TOP_SEEDS = 5
+
+# Static profile
+PROFILE_MAX_FACTS = 30
+PROFILE_MAX_TOKENS = 400
+PROFILE_SECTIONS = ["identity", "professional", "communication_style", "relationships"]
+PROFILE_MIN_NOTES = 5
+PROFILE_REGENERATE_INTERVAL_HOURS = 24

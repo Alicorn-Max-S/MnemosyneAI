@@ -153,15 +153,16 @@ WORKER_POLL_INTERVAL = 2.0
 
 # --- Phase 3: Retrieval scoring ---
 PROVENANCE_WEIGHTS = {"organic": 1.0, "user_confirmed": 0.8, "agent_prompted": 0.5, "inferred": 0.3}
-DECAY_BASE_LAMBDA = 0.1          # Base decay rate
+DECAY_LAMBDA_BASE = 0.1          # Base decay rate
 DECAY_IMPORTANCE_FACTOR = 0.8    # How much importance slows decay
 DECAY_ACCESS_BOOST = 0.15        # Per-access strength boost
-DECAY_MIN_MEMORIES = 100         # Decay disabled below this count
+DECAY_MEMORY_THRESHOLD = 100     # Decay disabled below this count
 DECAY_RAMP_MAX = 1000            # Decay reaches full effect here
-DECAY_HIGH_IMPORTANCE_FLOOR = 0.3  # Min strength for importance >= 0.7
-SURFACING_FATIGUE_FACTOR = 0.1
+DECAY_HIGH_IMPORTANCE_THRESHOLD = 0.7  # Importance level that triggers floor
+DECAY_HIGH_IMPORTANCE_FLOOR = 0.3  # Min strength for importance >= threshold
+SURFACING_FATIGUE_RATE = 0.1
 MMR_SIMILARITY_THRESHOLD = 0.90
-INFERENCE_SCORE_DISCOUNT = 0.7   # Inferences weighted lower than observations
+INFERENCE_DISCOUNT = 0.7         # Inferences weighted lower than observations
 RETRIEVAL_FTS_LIMIT = 30
 RETRIEVAL_VECTOR_LIMIT = 30
 RETRIEVAL_FINAL_LIMIT = 10
@@ -283,10 +284,11 @@ class RetrievalResult(BaseModel):
     decay_strength: float
     provenance_weight: float
     fatigue_factor: float
+    inference_discount: float # 0.7 for inferences, 1.0 for observations
     source: str               # "fts" | "vector" | "link" | "both" | "fts+link" | etc.
 ```
 
-Note: the `colbert_score` and `composite_score` fields are Phase 4 additions to the Phase 3 model. Phase 3 implementation should include `composite_score` (same as `score` when no ColBERT) and `colbert_score: float | None = None`.
+Note: the `colbert_score`, `composite_score`, and `inference_discount` fields are Phase 4 additions to the Phase 3 model. Phase 3 implementation should include `composite_score` (same as `score` when no ColBERT), `colbert_score: float | None = None`, and `inference_discount` (0.7 for inferences, 1.0 for observations).
 
 ### Phase 4 addition
 
@@ -350,7 +352,7 @@ After creating each note and inserting into Zvec, the handler calls `linker.gene
 # In handle_derive(), after db.create_note() and zvec.insert():
 if linker is not None:
     try:
-        links = await asyncio.to_thread(linker.generate_links, note_obj, embedding)
+        links = await linker.generate_links(note_obj, embedding)
     except Exception:
         logger.warning("Link generation failed for note %s", note_obj.id)
 ```
@@ -435,7 +437,7 @@ The `colbert_reranker` parameter is Phase 4. If `None`, retrieval uses Phase 3 b
 Steps:
 1. **Parallel search**: FTS5 (async) overlapped with embed_query (sync ~10ms) + Zvec search (sync ~2-5ms).
 2. **Hydrate**: collect all unique IDs → `db.get_notes_by_ids()` → filter by peer_id.
-3. **Link expansion (Phase 4)**: Take the top `LINK_EXPANSION_TOP_SEEDS` (5) results by preliminary score. For each seed, call `db.get_linked_notes([seed_id], depth=1, max_per_seed=5)`. Deduplicate against already-known candidates. Add link-expanded notes to the pool with source `"link"`.
+3. **Link expansion (Phase 4)**: Take the top `LINK_EXPANSION_TOP_SEEDS` (5) results by preliminary RRF score. Call `db.get_linked_notes(seed_ids, depth=LINK_EXPANSION_DEPTH, max_per_seed=LINK_EXPANSION_MAX)` in a single batch. Filter by peer_id, deduplicate against already-known candidates. Add link-expanded notes to the pool with source `"link"`.
 4. **RRF fusion**: build ranked ID lists (FTS, vector, and link-expanded if Phase 4) → `rrf_fuse()`. Track source ("fts"/"vector"/"link"/"both"/compound tags).
 5. **Score**: `db.count_notes(peer_id)`. For each note compute days_since_access (from last_accessed_at or created_at), then call all scorer functions → composite score.
 6. **Sort + final stage**:
@@ -457,9 +459,9 @@ No LLM calls. Pure embedding similarity. Runs as part of the write pipeline (aft
 
 **`Linker.__init__(db: SQLiteStore, zvec: ZvecStore, embedder: Embedder)`** — Stores references.
 
-**`Linker.generate_links(note: Note, embedding: list[float]) → list[Link]`**
+**`async Linker.generate_links(note: Note, embedding: list[float]) → list[Link]`**
 
-For a newly created note, find candidate links and create them.
+Async method. For a newly created note, find candidate links and create them. Uses `asyncio.to_thread()` internally for Zvec search and awaits SQLite calls directly.
 
 Steps:
 1. **Find candidates**: Search Zvec with the note's embedding → top `LINK_MAX_CANDIDATES + 1` results (the +1 accounts for the note itself). Filter out the note's own ID.
@@ -473,9 +475,9 @@ Steps:
 
 **Error handling**: If Zvec search fails, log a warning and return `[]`. If individual link creation fails (e.g., duplicate), log at DEBUG and skip. Never raise — linking failure must not block the write pipeline.
 
-**`Linker.find_neighbors(note_id: str, max_results: int = 5) → list[tuple[Note, float]]`**
+**`async Linker.find_neighbors(note_id: str, max_results: int = 5) → list[tuple[Note, float]]`**
 
-Public query method for retrieval. Fetches all links for `note_id` from `db.get_links()`, then hydrates the linked notes. Returns `(Note, link_strength)` tuples sorted by strength descending, capped at `max_results`.
+Async public query method. Fetches all links for `note_id` from `db.get_links()`, then hydrates the linked notes. Returns `(Note, link_strength)` tuples sorted by strength descending, capped at `max_results`.
 
 ### intelligence/reranker.py — ColBERT Reranker Wrapper
 
