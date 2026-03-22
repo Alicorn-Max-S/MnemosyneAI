@@ -1,6 +1,6 @@
-# Mnemosyne — Spec (Phases 1–4)
+# Mnemosyne — Spec
 
-AI agent memory system. Phase 1: foundation (SQLite, FTS5, embeddings, Zvec). Phase 2: async write pipeline (Deriver via DeepSeek V3.2). Phase 3: retrieval pipeline (parallel search, RRF fusion, scoring, MMR dedup). Phase 4: intelligence layer (A-MEM link generation, link expansion, ColBERT reranking, static profile).
+AI agent memory system. SQLite + FTS5 + Zvec for storage/search. Async write pipeline (Deriver via DeepSeek V3.2). Retrieval pipeline (parallel search, RRF fusion, scoring, MMR dedup). Intelligence layer (A-MEM links, ColBERT reranking, static profile). Background processes (batch dedup, Dreamer via Gemini 3 Flash Batch API, MAGMA multi-graph).
 
 ---
 
@@ -14,33 +14,41 @@ mnemosyne/
 ├── mnemosyne/
 │   ├── __init__.py
 │   ├── config.py               # All constants, thresholds, API config
-│   ├── models.py               # Pydantic: Peer, Session, Message, Note, Link, TaskItem,
-│   │                           #   RetrievalResult, PeerProfile
+│   ├── models.py               # Pydantic: Peer, Session, Message, Note, Link, TaskItem, RetrievalResult
 │   ├── db/
-│   │   └── sqlite_store.py     # All SQLite CRUD, FTS5 search, task queue, access tracking,
-│   │                           #   link graph traversal, profile storage
+│   │   └── sqlite_store.py     # All SQLite CRUD, FTS5 search, task queue, access tracking
 │   ├── vectors/
 │   │   ├── zvec_store.py       # Zvec insert/search/delete wrapper
 │   │   └── embedder.py         # nomic-embed-text-v1.5 (ONNX preferred, PyTorch fallback)
 │   ├── api/
 │   │   └── memory_api.py       # Public API coordinating all stores
-│   ├── pipeline/               # Phase 2: write path
+│   ├── pipeline/               # Write path
 │   │   ├── __init__.py         # create_worker() factory
 │   │   ├── intake.py           # Fast-path message ingestion (<5ms)
 │   │   ├── deriver.py          # Extractor + Scorer (DeepSeek V3.2 via NousResearch)
-│   │   ├── handlers.py         # handle_derive: extract → score → embed → store → link
+│   │   ├── handlers.py         # handle_derive: extract → score → embed → store
 │   │   └── worker.py           # Queue polling loop + dispatch
-│   ├── retrieval/              # Phase 3: read path
+│   ├── retrieval/              # Read path
 │   │   ├── __init__.py         # create_retriever() factory
 │   │   ├── scorer.py           # Pure functions: decay, provenance weight, fatigue, composite
 │   │   ├── fusion.py           # RRF fusion + MMR dedup
-│   │   └── retriever.py        # Orchestrator: parallel search → link expand → fuse → score
-│   │                           #   → ColBERT rerank → return
-│   ├── intelligence/           # Phase 4: intelligence layer
-│   │   ├── __init__.py         # create_linker(), create_reranker(), create_profiler() factories
-│   │   ├── linker.py           # A-MEM link generation (embedding similarity, no LLM)
-│   │   ├── reranker.py         # ColBERT reranker wrapper via rerankers library
-│   │   └── profiler.py         # Static profile generation via Deriver API
+│   │   └── retriever.py        # Orchestrator: parallel search → fuse → score → dedup → return
+│   ├── intelligence/           # A-MEM links, ColBERT, static profile
+│   │   ├── __init__.py
+│   │   ├── link_generator.py   # Cosine-similarity link creation (threshold 0.75)
+│   │   ├── colbert_reranker.py # answerai-colbert-small-v1 via pylate (pre-computed tokens)
+│   │   └── profile_generator.py # Static Peer Card generation via Deriver API
+│   ├── dreamer/                # Background processing
+│   │   ├── __init__.py         # create_dreamer() factory
+│   │   ├── dedup.py            # Batch dedup: cosine clustering + union-find merge
+│   │   ├── gemini_client.py    # Gemini Batch API wrapper (google-genai SDK)
+│   │   ├── prompts.py          # System prompts for all Dreamer tasks
+│   │   ├── task_builder.py     # Builds batch request payloads from buffered notes
+│   │   ├── processor.py        # Processes batch results back into stores
+│   │   └── orchestrator.py     # Coordinates full Dreamer cycle
+│   ├── graph/                  # MAGMA multi-graph
+│   │   ├── __init__.py
+│   │   └── magma.py            # Entity extraction, graph operations, link expansion
 │   └── utils/
 │       └── ids.py              # ULID generation
 └── tests/
@@ -52,17 +60,19 @@ mnemosyne/
     ├── test_worker.py
     ├── test_intake.py
     ├── test_deriver.py
-    ├── test_write_pipeline.py      # Phase 2 integration
-    ├── test_models.py
-    ├── test_scorer.py              # Phase 3: pure unit tests
-    ├── test_fusion.py              # Phase 3: RRF + MMR
-    ├── test_retriever.py           # Phase 3: integration with real stores
-    ├── test_retrieval_pipeline.py  # Phase 3: end-to-end write-then-read
-    ├── test_linker.py              # Phase 4: A-MEM link generation
-    ├── test_reranker.py            # Phase 4: ColBERT reranker
-    ├── test_profiler.py            # Phase 4: static profile generation
-    ├── test_link_expansion.py      # Phase 4: link expansion in retrieval
-    └── test_intelligence_pipeline.py  # Phase 4: end-to-end intelligence integration
+    ├── test_write_pipeline.py
+    ├── test_scorer.py
+    ├── test_fusion.py
+    ├── test_retriever.py
+    ├── test_retrieval_pipeline.py
+    ├── test_link_generator.py
+    ├── test_colbert_reranker.py
+    ├── test_profile_generator.py
+    ├── test_dedup.py
+    ├── test_gemini_client.py
+    ├── test_dreamer_orchestrator.py
+    ├── test_magma.py
+    └── test_dreamer_pipeline.py  # End-to-end: buffer → dedup → dream → links + profile
 ```
 
 ---
@@ -72,7 +82,7 @@ mnemosyne/
 ```toml
 [project]
 name = "mnemosyne"
-version = "0.4.0"
+version = "0.5.0"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.20.0",
@@ -80,28 +90,26 @@ dependencies = [
     "sentence-transformers[onnx]>=5.0.0",
     "onnxruntime>=1.18.0",
     "einops>=0.8.0",
+    "httpx>=0.27.0",
     "pydantic>=2.0.0",
     "python-ulid>=3.0.0",
-    "httpx>=0.27.0",
     "numpy>=1.26.0",
-    "rerankers[transformers]>=0.10.0",
+    "pylate>=1.3.0",
+    "google-genai>=1.0.0",
+    "networkx>=3.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
 ```
 
-Do NOT add fastapi, uvicorn, ragatouille, pylate, colbert-ai, networkx, or google-genai yet. Those are Phase 5+.
-
-numpy is added in Phase 3 for MMR cosine similarity (already a transitive dep of sentence-transformers, but pinned explicitly since fusion.py imports it directly).
-
-rerankers is added in Phase 4 for ColBERT reranking. The `[transformers]` extra is required for local model inference. Do NOT use `ragatouille` or `pylate` — the `rerankers` library provides the simplest API for reranking a small candidate set without managing a persistent ColBERT index.
+Do NOT add fastapi, uvicorn, ragatouille, or rerankers. Those are not needed.
 
 ---
 
 ## config.py
 
-All constants live here. Key additions per phase are marked.
+All constants live here.
 
 ```python
 # Storage
@@ -142,7 +150,7 @@ DEFAULT_CONFIDENCE_INFERENCE = 0.6
 DEFAULT_CONFIDENCE_USER_SET = 1.0
 DEFAULT_EMOTIONAL_WEIGHT = 0.5
 
-# --- Phase 2: Deriver API ---
+# Deriver API
 NOUSRESEARCH_BASE_URL = "https://inference-api.nousresearch.com/v1"
 NOUSRESEARCH_MODEL = "deepseek/deepseek-v3.2"
 DERIVER_EXTRACT_TEMPERATURE = 0.1
@@ -151,46 +159,55 @@ DERIVER_MAX_RETRIES = 3
 DERIVER_RETRY_DELAYS = [1.0, 2.0, 4.0]
 WORKER_POLL_INTERVAL = 2.0
 
-# --- Phase 3: Retrieval scoring ---
+# Retrieval scoring
 PROVENANCE_WEIGHTS = {"organic": 1.0, "user_confirmed": 0.8, "agent_prompted": 0.5, "inferred": 0.3}
-DECAY_LAMBDA_BASE = 0.1          # Base decay rate
-DECAY_IMPORTANCE_FACTOR = 0.8    # How much importance slows decay
-DECAY_ACCESS_BOOST = 0.15        # Per-access strength boost
-DECAY_MEMORY_THRESHOLD = 100     # Decay disabled below this count
-DECAY_RAMP_MAX = 1000            # Decay reaches full effect here
-DECAY_HIGH_IMPORTANCE_THRESHOLD = 0.7  # Importance level that triggers floor
-DECAY_HIGH_IMPORTANCE_FLOOR = 0.3  # Min strength for importance >= threshold
-SURFACING_FATIGUE_RATE = 0.1
+DECAY_BASE_LAMBDA = 0.1
+DECAY_IMPORTANCE_FACTOR = 0.8
+DECAY_ACCESS_BOOST = 0.15
+DECAY_MIN_MEMORIES = 100
+DECAY_RAMP_MAX = 1000
+DECAY_HIGH_IMPORTANCE_FLOOR = 0.3
+SURFACING_FATIGUE_FACTOR = 0.1
 MMR_SIMILARITY_THRESHOLD = 0.90
-INFERENCE_DISCOUNT = 0.7         # Inferences weighted lower than observations
+INFERENCE_SCORE_DISCOUNT = 0.7
 RETRIEVAL_FTS_LIMIT = 30
 RETRIEVAL_VECTOR_LIMIT = 30
 RETRIEVAL_FINAL_LIMIT = 10
 
-# --- Phase 4: Intelligence layer ---
-
-# ColBERT reranking
-COLBERT_MODEL = "answerdotai/answerai-colbert-small-v1"
-COLBERT_RERANK_CANDIDATES = 30      # Max candidates to rerank
-COLBERT_TOP_N = 10                  # Return top N after reranking
-
 # A-MEM link generation
-LINK_SIMILARITY_THRESHOLD = 0.75    # Cosine similarity threshold for creating links
-LINK_MAX_CANDIDATES = 10            # Max candidate notes to evaluate for linking
-LINK_DEFAULT_STRENGTH = 0.5         # Default link strength
-LINK_STRENGTH_FROM_SIMILARITY = True  # Map cosine similarity to link strength
+LINK_SIMILARITY_THRESHOLD = 0.75
+LINK_CANDIDATE_LIMIT = 20
+LINK_MAX_PER_NOTE = 5
 
-# Link expansion in retrieval
-LINK_EXPANSION_DEPTH = 1            # Walk links N hops (1 = direct neighbors only)
-LINK_EXPANSION_MAX = 5              # Max notes to add from link expansion per seed note
-LINK_EXPANSION_TOP_SEEDS = 5        # Number of top retrieval results to expand from
+# ColBERT reranking (pre-computed token embeddings)
+COLBERT_MODEL = "answerdotai/answerai-colbert-small-v1"
+COLBERT_TOKEN_DIM = 96
+COLBERT_RERANK_LIMIT = 50
+COLBERT_TOP_N = 10
 
 # Static profile
-PROFILE_MAX_FACTS = 30              # Max facts in the static profile
-PROFILE_MAX_TOKENS = 400            # Approximate token budget for the profile
+PROFILE_MAX_FACTS = 30
 PROFILE_SECTIONS = ["identity", "professional", "communication_style", "relationships"]
-PROFILE_MIN_NOTES = 5               # Min permanent notes before generating a profile
-PROFILE_REGENERATE_INTERVAL_HOURS = 24  # How often to regenerate the profile
+PROFILE_GENERATION_TEMPERATURE = 0.1
+
+# Batch dedup
+DEDUP_COSINE_THRESHOLD = 0.85
+DEDUP_MIN_CLUSTER_SIZE = 2
+
+# Dreamer — Gemini Batch API
+GEMINI_MODEL = "gemini-3-flash-preview"
+DREAMER_TEMPERATURE = 0.3
+DREAMER_POLL_INTERVAL = 30.0
+DREAMER_MAX_POLL_TIME = 86400  # 24 hours
+DREAMER_LINK_TEMPERATURE = 0.3
+DREAMER_PATTERN_TEMPERATURE = 0.3
+DREAMER_CONTRADICTION_TEMPERATURE = 0.1
+DREAMER_PROFILE_TEMPERATURE = 0.1
+
+# MAGMA graph
+ENTITY_GRAPH_NAME = "entity"
+TEMPORAL_GRAPH_NAME = "temporal"
+CAUSAL_GRAPH_NAME = "causal"
 ```
 
 ---
@@ -206,7 +223,7 @@ PRAGMA foreign_keys=ON;
 
 All PKs are TEXT (ULIDs). Timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
 
-**Tables:** config, peers, sessions, messages, notes, links, task_queue, peer_profiles. See `sqlite_store.py` for full DDL. The critical table is **notes**:
+**Tables:** config, peers, sessions, messages, notes, links, task_queue, entity_mentions. See `sqlite_store.py` for full DDL. The critical table is **notes**:
 
 | Column group | Columns |
 |---|---|
@@ -219,17 +236,26 @@ All PKs are TEXT (ULIDs). Timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
 | Pipeline state | is_buffered, canonical_note_id, zvec_id |
 | Timestamps | created_at, updated_at |
 
-**peer_profiles table (Phase 4):**
+**entity_mentions** — tracks entities extracted from notes for the MAGMA entity graph:
 
-```sql
-CREATE TABLE IF NOT EXISTS peer_profiles (
-    peer_id TEXT PRIMARY KEY REFERENCES peers(id),
-    sections TEXT NOT NULL DEFAULT '{}',
-    fact_count INTEGER NOT NULL DEFAULT 0,
-    generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    source_note_ids TEXT NOT NULL DEFAULT '[]'
-);
-```
+| Column | Type | Description |
+|---|---|---|
+| id | TEXT PK | ULID |
+| note_id | TEXT FK | References notes(id) |
+| peer_id | TEXT FK | References peers(id) |
+| entity_name | TEXT | Normalized entity name (lowercased) |
+| entity_type | TEXT | person, place, organization, concept, other |
+| mention_context | TEXT | Sentence or phrase containing the mention |
+| created_at | TEXT | Timestamp |
+
+**colbert_tokens** — pre-computed ColBERT token-level embeddings for MaxSim reranking:
+
+| Column | Type | Description |
+|---|---|---|
+| note_id | TEXT PK FK | References notes(id), one row per note |
+| token_embeddings | BLOB | Serialized numpy array of shape (num_tokens, 96) |
+| num_tokens | INTEGER | Number of tokens (for quick size checks without deserializing) |
+| created_at | TEXT | Timestamp |
 
 **FTS5** virtual table on (content, context_description, keywords, tags) with sync triggers for INSERT/UPDATE/DELETE. Without triggers, FTS5 returns nothing.
 
@@ -237,370 +263,327 @@ CREATE TABLE IF NOT EXISTS peer_profiles (
 
 ## SQLiteStore Methods
 
-### Phases 1–2 (already implemented)
+**CRUD**: peers, sessions, messages, notes, links. Task queue with atomic dequeue (UPDATE...RETURNING). `fts_search()` with BM25 scoring.
 
-CRUD for peers/sessions/messages/notes/links. Task queue with atomic dequeue (UPDATE...RETURNING). `fts_search()` with BM25 scoring.
+**Retrieval support:**
 
-### Phase 3 additions
-
-- `fts_search_ranked(query, peer_id, limit=30)` → note dicts with 0-indexed `fts_rank` positions (not just BM25 scores). RRF needs rank positions, not raw scores.
+- `fts_search_ranked(query, peer_id, limit=30)` → note dicts with 0-indexed `fts_rank` positions. RRF needs rank positions, not raw scores.
 - `get_notes_by_ids(note_ids)` → fetch full rows for a list of IDs. Used to hydrate Zvec results from SQLite.
-- `record_access(note_ids)` → batch UPDATE incrementing access_count, times_surfaced, and setting last_accessed_at. Single transaction. Called after retrieval returns final results.
-- `count_notes(peer_id)` → integer count. Used by decay scoring to check if decay is active.
+- `record_access(note_ids)` → batch UPDATE incrementing access_count, times_surfaced, and setting last_accessed_at. Single transaction.
+- `count_notes(peer_id)` → integer count for decay scoring.
 
-### Phase 4 additions
+**Link expansion:**
 
-- `get_linked_notes(note_ids: list[str], depth: int = 1, max_per_seed: int = 5) → list[Note]` — Walk the link graph from a set of seed note IDs. Returns notes that are linked (directly or up to `depth` hops) to any seed. Steps:
-  1. Query the `links` table for rows where `source_note_id IN (?) OR target_note_id IN (?)`.
-  2. Collect the "other side" note IDs that are NOT already in `note_ids`.
-  3. Cap at `max_per_seed` per seed note.
-  4. Fetch full `Note` rows via `get_notes_by_ids()`.
-  5. If `depth > 1`, recurse with the new IDs (but never re-visit already-seen IDs).
-  6. Return deduplicated list of Notes.
+- `get_linked_note_ids(note_id, max_depth=1)` → BFS walk returning connected note IDs.
+- `get_links_by_type(note_id, link_type)` → filter links by type.
 
-- `upsert_profile(peer_id: str, sections: dict, fact_count: int, source_note_ids: list[str]) → PeerProfile` — INSERT OR REPLACE into `peer_profiles`. Return the `PeerProfile` object.
+**Batch dedup:**
 
-- `get_profile(peer_id: str) → PeerProfile | None` — Fetch the profile for a peer. Return `None` if no profile exists.
+- `get_buffered_notes(peer_id)` → all notes with `is_buffered=1` for a peer, ordered by created_at.
+- `merge_notes(canonical_id, merged_ids)` → set `canonical_note_id` on merged notes, sum `evidence_count` on canonical, set `is_buffered=0` on all. Single transaction.
+- `get_unique_sessions_for_notes(note_ids)` → count distinct session_ids across a set of notes.
 
-- `get_permanent_notes(peer_id: str, limit: int = 50) → list[Note]` — Convenience method: `SELECT * FROM notes WHERE peer_id = ? AND durability = 'permanent' ORDER BY importance DESC, created_at DESC LIMIT ?`.
+**Entity graph:**
 
----
+- `add_entity_mention(note_id, peer_id, entity_name, entity_type, mention_context)` → insert into entity_mentions.
+- `get_entity_mentions(peer_id, entity_name)` → all mentions of an entity for a peer.
+- `get_entities_for_peer(peer_id)` → distinct entity names and types.
 
-## Pydantic Models (models.py)
+**ColBERT token storage:**
 
-### Existing models (Phases 1–2)
-
-Peer, Session, Message, Note, Link, TaskItem. All have `from_row()` class methods for aiosqlite Row dict construction. See source for full definitions.
-
-### Phase 3 addition
-
-```python
-class RetrievalResult(BaseModel):
-    note: Note
-    score: float              # Final score (ColBERT if available, else composite)
-    composite_score: float    # Pre-reranking composite score
-    rrf_score: float          # Raw RRF before multipliers
-    colbert_score: float | None = None  # ColBERT MaxSim score, None if ColBERT unavailable
-    decay_strength: float
-    provenance_weight: float
-    fatigue_factor: float
-    inference_discount: float # 0.7 for inferences, 1.0 for observations
-    source: str               # "fts" | "vector" | "link" | "both" | "fts+link" | etc.
-```
-
-Note: the `colbert_score`, `composite_score`, and `inference_discount` fields are Phase 4 additions to the Phase 3 model. Phase 3 implementation should include `composite_score` (same as `score` when no ColBERT), `colbert_score: float | None = None`, and `inference_discount` (0.7 for inferences, 1.0 for observations).
-
-### Phase 4 addition
-
-```python
-class PeerProfile(BaseModel):
-    """A static profile (Peer Card) generated from permanent notes."""
-
-    peer_id: str
-    sections: dict[str, str]  # section_name -> text content
-    fact_count: int
-    generated_at: str
-    source_note_ids: list[str] = Field(default_factory=list)
-
-    @classmethod
-    def from_row(cls, row: dict) -> "PeerProfile":
-        """Construct from an aiosqlite Row dict."""
-        data = dict(row)
-        if isinstance(data.get("sections"), str):
-            data["sections"] = json.loads(data["sections"])
-        if isinstance(data.get("source_note_ids"), str):
-            data["source_note_ids"] = json.loads(data["source_note_ids"])
-        return cls(**data)
-```
+- `store_colbert_tokens(note_id, token_embeddings_blob, num_tokens)` → insert or replace into colbert_tokens.
+- `get_colbert_tokens(note_ids) → dict[str, bytes]` — batch fetch token embedding BLOBs for a list of note IDs. Returns {note_id: blob} dict. Missing IDs are omitted.
+- Token embeddings are stored as `numpy.ndarray.tobytes()` and reconstructed with `numpy.frombuffer(...).reshape(num_tokens, COLBERT_TOKEN_DIM)`.
 
 ---
 
 ## Embedder / ZvecStore / MemoryAPI
 
-Already implemented in Phases 1–2. See source files for details.
+Already implemented. See source files for details.
 
-**Key facts for Phases 3–4:**
+**Key facts:**
 - `Embedder.embed_query(text)` prepends `"search_query: "`, returns 384-dim L2-normalized list[float].
 - `Embedder.embed_documents(texts)` batch version for MMR embedding.
-- `Embedder.embed_document(text)` single document embedding with `"search_document: "` prefix.
 - `ZvecStore.search(query_embedding, top_k)` returns `[{"id": str, "score": float}, ...]`.
 - Zvec has **no scalar fields/filtering** — returns results across all peers. Post-filter by peer_id after hydrating from SQLite.
-- For L2-normalized vectors (which nomic-embed produces), Zvec's score represents inner product = cosine similarity. Higher = more similar. Use the score directly for the link threshold comparison.
-- MemoryAPI gains `retrieve(query, peer_id, limit)` which delegates to the Retriever.
+- MemoryAPI gains `retrieve(query, peer_id, limit)` which delegates to the Retriever, and `run_dreamer_cycle(peer_id)` which delegates to the Dreamer orchestrator.
 
 ---
 
-## Write Pipeline (Phase 2, extended in Phase 4)
+## Write Pipeline
 
-### Fast path (synchronous, ~5ms, user never waits)
-
-1. **intake.py**: `ingest_message()` writes to SQLite + enqueues "derive" task for user messages. Assistant messages stored but not derived.
-
-### Async pipeline
-
+1. **intake.py**: `ingest_message()` writes to SQLite + enqueues "derive" task for user messages. Assistant messages stored but not derived. < 5ms.
 2. **deriver.py**: `Deriver.extract()` → atomic facts from user message. `Deriver.score()` → tags each note with emotional_weight, provenance, durability, keywords, tags, context_description. Both call DeepSeek V3.2 via NousResearch (httpx, not openai SDK). Retry 3x with 1/2/4s backoff.
-
-3. **handlers.py**: `handle_derive()` wires extract → score → embed → store (SQLite + Zvec) → **link** (Phase 4).
-
+3. **handlers.py**: `handle_derive()` wires extract → score → embed → store (SQLite + Zvec). Also pre-computes ColBERT token embeddings and stores them, and extracts entities for MAGMA.
 4. **worker.py**: polls task queue, dispatches to handlers, manages retries/dead-letter.
 
-### Phase 4 write path addition: Link generation
-
-After creating each note and inserting into Zvec, the handler calls `linker.generate_links(note, embedding)`:
-
-```python
-# In handle_derive(), after db.create_note() and zvec.insert():
-if linker is not None:
-    try:
-        links = await linker.generate_links(note_obj, embedding)
-    except Exception:
-        logger.warning("Link generation failed for note %s", note_obj.id)
-```
-
-The `handle_derive` function signature gains an optional `linker: Linker | None = None` parameter. The `create_worker()` factory also gains this parameter.
-
-**Critical rules**: Agent responses are read for context but NEVER extracted from. User confirmations get `provenance: "user_confirmed"`. Notes stored with `is_buffered=1` for the Dreamer (Phase 5). Link generation failure NEVER blocks the write pipeline.
+**Critical rules**: Agent responses are read for context but NEVER extracted from. User confirmations get `provenance: "user_confirmed"`. Notes stored with `is_buffered=1` for the Dreamer.
 
 ---
 
-## Retrieval Pipeline (Phases 3–4)
+## Retrieval Pipeline
 
-No LLM calls in the read path. Pure local computation. Target: < 120ms end-to-end (Phase 4 budget; Phase 3 alone targets < 80ms).
-
-### Full retrieval flow (Phase 4)
+No LLM calls. Pure local computation. Target: < 100ms with ColBERT, < 80ms without.
 
 ```
 Query
   ├→ embed_query() ──→ Zvec search (top 30)
   ├→ FTS5 search (top 30)
+  ├→ Link expansion on top vector hits (BFS depth 1)
   │         ↓
   │    Hydrate from SQLite + peer_id filter
   │         ↓
-  │    ★ Link expansion: top 5 results → walk links → add neighbors to pool  [Phase 4]
-  │         ↓
-  │    RRF Fusion (k=60) — now includes link-expanded notes as third list
+  │    RRF Fusion (k=60) across all three streams
   │         ↓
   │    Score multipliers: decay × provenance × fatigue × inference_discount
   │         ↓
-  │    Sort by composite score
+  │    ColBERT rerank top 50 → top 10
+  │    (encode query tokens, load pre-computed doc tokens from SQLite, MaxSim)
   │         ↓
-  │    ★ ColBERT rerank top 30 → keep top 10  [Phase 4, optional]
-  │    OR MMR Dedup (cosine > 0.90 → drop lower-scored)  [Phase 3 fallback]
+  │    MMR Dedup (cosine > 0.90 → drop lower-scored)
   │         ↓
-  │    record_access() → return
+  │    Top-N (default 10) → record_access() → return
 ```
 
-Steps marked with ★ are Phase 4 additions. Without Phase 4 components, the pipeline falls back to Phase 3 behavior (no link expansion, MMR dedup instead of ColBERT).
+### scorer.py — Pure scoring functions
 
-### scorer.py — Pure scoring functions (Phase 3)
+All functions are stateless, no I/O.
 
-All functions are stateless, no I/O. Take note metadata, return floats.
+- `compute_decay_strength(importance, days_since_access, access_count, total_memories)` — Ebbinghaus decay with importance-weighted lambda, access boost, ramp from 100–1000 memories, floor of 0.3 for high importance.
+- `compute_provenance_weight(provenance)` — Lookup from `PROVENANCE_WEIGHTS`.
+- `compute_surfacing_fatigue(times_surfaced)` — `1 / (1 + 0.1 * times_surfaced)`
+- `compute_inference_discount(note_type)` — "inference" → 0.7, else → 1.0.
+- `compute_composite_score(rrf_score, decay, provenance, fatigue, inference_discount)` — multiply all factors.
 
-**`compute_decay_strength(importance, days_since_access, access_count, total_memories) → float`**
-- Formula: `strength = importance * exp(-lambda_eff * days) * (1 + 0.15 * access_count)` where `lambda_eff = 0.1 * (1 - importance * 0.8)`
-- Disabled (returns 1.0) when total_memories < 100
-- Ramps linearly between 100–1000 memories: `ramp = min(1.0, total / 1000)`
-- Floor of 0.3 for importance >= 0.7
-- Clamped to [0.0, 1.0]
+### fusion.py — RRF + MMR
 
-**`compute_provenance_weight(provenance) → float`**
-- Lookup from `PROVENANCE_WEIGHTS`. Unknown → 0.5.
+- `rrf_fuse(ranked_lists, k=60)` — 0-indexed ranks. Notes in multiple lists get multiple contributions.
+- `mmr_dedup(scored_ids, embeddings, threshold=0.90)` — cosine = dot product for L2-normalized vectors. Missing embeddings → auto-accept.
 
-**`compute_surfacing_fatigue(times_surfaced) → float`**
-- Formula: `1 / (1 + 0.1 * times_surfaced)`
+### retriever.py — Orchestrator
 
-**`compute_inference_discount(note_type) → float`**
-- "inference" → 0.7, else → 1.0
+Steps: parallel search → hydrate → RRF → score → ColBERT rerank (query encode + pre-computed MaxSim) → MMR dedup → truncate → record access → return.
 
-**`compute_composite_score(rrf_score, decay, provenance, fatigue, inference_discount) → float`**
-- Multiply all factors together.
-
-### fusion.py — RRF + MMR (Phase 3)
-
-**`rrf_fuse(ranked_lists: list[list[str]], k=60) → dict[str, float]`**
-- For each note across all lists: `score += 1 / (k + rank)` (0-indexed).
-- Notes in multiple lists get multiple contributions.
-
-**`mmr_dedup(scored_ids, embeddings: dict[str, list[float]], threshold=0.90) → list[str]`**
-- Walk sorted IDs. Skip any candidate with cosine > threshold to an already-accepted result.
-- nomic embeddings are L2-normalized, so cosine = dot product (use `np.dot`).
-- Missing embeddings → auto-accept the note.
-
-### retriever.py — Orchestrator (Phase 3, extended in Phase 4)
-
-**`Retriever.__init__(db, zvec, embedder, colbert_reranker=None)`**
-
-The `colbert_reranker` parameter is Phase 4. If `None`, retrieval uses Phase 3 behavior.
-
-**`Retriever.retrieve(query, peer_id, limit=10) → list[RetrievalResult]`**
-
-Steps:
-1. **Parallel search**: FTS5 (async) overlapped with embed_query (sync ~10ms) + Zvec search (sync ~2-5ms).
-2. **Hydrate**: collect all unique IDs → `db.get_notes_by_ids()` → filter by peer_id.
-3. **Link expansion (Phase 4)**: Take the top `LINK_EXPANSION_TOP_SEEDS` (5) results by preliminary RRF score. Call `db.get_linked_notes(seed_ids, depth=LINK_EXPANSION_DEPTH, max_per_seed=LINK_EXPANSION_MAX)` in a single batch. Filter by peer_id, deduplicate against already-known candidates. Add link-expanded notes to the pool with source `"link"`.
-4. **RRF fusion**: build ranked ID lists (FTS, vector, and link-expanded if Phase 4) → `rrf_fuse()`. Track source ("fts"/"vector"/"link"/"both"/compound tags).
-5. **Score**: `db.count_notes(peer_id)`. For each note compute days_since_access (from last_accessed_at or created_at), then call all scorer functions → composite score.
-6. **Sort + final stage**:
-   - **If ColBERT reranker available (Phase 4):** Sort by composite score → take top `COLBERT_RERANK_CANDIDATES` (30) → call `colbert_reranker.rerank(query, candidates, top_n=COLBERT_TOP_N)`. ColBERT score becomes the final score. If ColBERT fails, fall through to MMR.
-   - **MMR dedup fallback (Phase 3):** sort by composite → batch-embed candidates via `embedder.embed_documents()` → `mmr_dedup()`. Cap on-the-fly embedding to ≤ 10 FTS-only notes.
-7. **Truncate** to `limit`.
-8. **Record access**: `db.record_access(final_ids)` — best-effort, never blocks.
-9. **Return** `list[RetrievalResult]` sorted by score descending.
-
-**Error handling**: Zvec fails → FTS-only. FTS fails → vector-only. Both fail → empty list. Link expansion fails → skip, use FTS+vector only. ColBERT fails → fall back to MMR dedup. record_access failure → log, still return.
+**Error handling**: Zvec fails → FTS-only. FTS fails → vector-only. ColBERT fails → skip reranking (no pre-computed tokens for a note → rank it at end). Both search backends fail → empty list.
 
 ---
 
-## Intelligence Layer (Phase 4)
+## Intelligence Layer
 
-### intelligence/linker.py — A-MEM Link Generator
+### link_generator.py — A-MEM Link Generation
 
-No LLM calls. Pure embedding similarity. Runs as part of the write pipeline (after note creation + embedding).
+Generates typed bidirectional links between notes using embedding cosine similarity.
 
-**`Linker.__init__(db: SQLiteStore, zvec: ZvecStore, embedder: Embedder)`** — Stores references.
+- `LinkGenerator.__init__(db, zvec, embedder)` — stores references.
+- `LinkGenerator.generate_links(note)` — for a given note, find top `LINK_CANDIDATE_LIMIT` nearest neighbors in Zvec, filter by cosine ≥ `LINK_SIMILARITY_THRESHOLD` (0.75), cap at `LINK_MAX_PER_NOTE` (5), create `"semantic"` links in SQLite. No LLM call — pure embedding math.
+- Called from `handle_derive()` after note creation. Failure does not block note persistence.
 
-**`async Linker.generate_links(note: Note, embedding: list[float]) → list[Link]`**
+### colbert_reranker.py — ColBERT Reranking (Pre-computed Token Embeddings)
 
-Async method. For a newly created note, find candidate links and create them. Uses `asyncio.to_thread()` internally for Zvec search and awaits SQLite calls directly.
+Uses `pylate` library with `answerdotai/answerai-colbert-small-v1` (33M params, 96-dim tokens, ~130MB).
 
-Steps:
-1. **Find candidates**: Search Zvec with the note's embedding → top `LINK_MAX_CANDIDATES + 1` results (the +1 accounts for the note itself). Filter out the note's own ID.
-2. **Filter by peer**: Only keep candidates with the same `peer_id` (hydrate via `db.get_notes_by_ids()`).
-3. **Filter by threshold**: Only keep candidates with cosine similarity ≥ `LINK_SIMILARITY_THRESHOLD` (0.75). Zvec returns inner product scores for L2-normalized vectors, which equals cosine similarity. Use the score directly.
-4. **Create links**: For each candidate above threshold, call `db.create_link()` with:
-   - `link_type = "semantic"` (Phase 4 only creates semantic links; causal/temporal links are Phase 5 Dreamer)
-   - `strength` = the cosine similarity score
-   - Skip if a link already exists between the two notes (catch the UNIQUE constraint exception)
-5. **Return** the list of created `Link` objects.
+**Write-time (pre-computation):**
+- `ColBERTReranker.__init__()` — loads model via `pylate.models.ColBERT(COLBERT_MODEL)`.
+- `ColBERTReranker.encode_document(text) → bytes` — encodes a note's text into token-level embeddings using `model.encode([text], is_query=False)`. Returns the numpy array serialized to bytes via `ndarray.tobytes()` for SQLite BLOB storage.
+- `ColBERTReranker.encode_documents(texts) → list[bytes]` — batch version.
+- Called from `handle_derive()` after note creation. Token embeddings stored in `colbert_tokens` table. Failure does not block note persistence.
 
-**Error handling**: If Zvec search fails, log a warning and return `[]`. If individual link creation fails (e.g., duplicate), log at DEBUG and skip. Never raise — linking failure must not block the write pipeline.
+**Read-time (reranking):**
+- `ColBERTReranker.rerank(query, candidate_note_ids, db, top_n=10) → list[str]` — encodes query tokens via `model.encode([query], is_query=True)`, loads pre-computed document token BLOBs from `db.get_colbert_tokens(candidate_note_ids)`, reconstructs numpy arrays, computes MaxSim scores via `pylate.rank.rerank()`, returns reranked note_ids.
+- Only the query requires a forward pass (~5ms). Document scoring is pure MaxSim matrix ops (~1-2ms for 50 candidates).
+- Notes without pre-computed tokens (e.g., legacy notes from before Phase 5) are auto-ranked at the end of the list.
 
-**`async Linker.find_neighbors(note_id: str, max_results: int = 5) → list[tuple[Note, float]]`**
+**Storage:** each note's token embeddings are ~(num_tokens × 96 × 4) bytes. A typical 50-token note ≈ 19KB raw. With numpy float32.
 
-Async public query method. Fetches all links for `note_id` from `db.get_links()`, then hydrates the linked notes. Returns `(Note, link_strength)` tuples sorted by strength descending, capped at `max_results`.
+- Model loaded lazily on first use. Failure → return original ranking (graceful degradation).
+- pylate is sync — wrap with `asyncio.to_thread()`.
 
-### intelligence/reranker.py — ColBERT Reranker Wrapper
+### profile_generator.py — Static Peer Card
 
-Wraps the `rerankers` library for ColBERT-based reranking of retrieval candidates.
+Generates a ~30-fact static profile organized into 4 sections: identity, professional, communication_style, relationships.
 
-**`ColBERTReranker.__init__(model_name: str = COLBERT_MODEL)`**
+- `ProfileGenerator.__init__(db, deriver)` — uses Deriver API (DeepSeek V3.2) for generation.
+- `ProfileGenerator.generate(peer_id)` → JSON dict with 4 sections, each a list of fact strings.
+- Input: all notes with `durability="permanent"` for the peer.
+- Output: stored in `peers.static_profile` and `peers.profile_updated_at`.
+- **No expertise/skill level in static profile** — this causes models to over-anchor. Expertise lives in dynamic memory.
+- User-set facts (confidence 1.0) override LLM observations (confidence 0.8).
 
-Load the model once at startup:
+---
+
+## Background Processes
+
+### Batch Dedup (dedup.py)
+
+Runs once at the start of every Dreamer cycle. Pure math, no LLM calls. ~100ms for 100 buffered notes.
+
+```
+Buffered notes (is_buffered=1)
+  ↓
+Embed all (batch, via embedder.embed_documents)
+  ↓
+Pairwise cosine similarity
+  ↓
+Cluster notes where cosine > 0.85 (union-find, NOT NetworkX)
+  ↓
+For each cluster:
+  - Pick highest-importance note as canonical
+  - Sum evidence_count across cluster
+  - Count unique_sessions_mentioned (one per session max)
+  - Set canonical_note_id on merged notes
+  - Set is_buffered=0 on all cluster members
+  ↓
+Compute importance for each canonical note:
+  importance = emotional_weight × 0.6 + frequency_score × 0.4
+  frequency_score = 1 - e^(-0.15 × unique_sessions_mentioned)
+```
+
+**`DedupProcessor.__init__(db, embedder)`**
+
+**`DedupProcessor.run(peer_id) → DedupResult`**
+- Fetch buffered notes → embed → cluster → merge → compute importance → return stats.
+- `DedupResult` is a dataclass: `notes_processed: int`, `clusters_found: int`, `notes_merged: int`.
+- If 0 or 1 buffered notes → return immediately (nothing to dedup).
+
+**Union-find implementation**: simple in-module `_UnionFind` class with `find()` and `union()`. Avoids NetworkX dependency for this fast path.
+
+### Gemini Client (gemini_client.py)
+
+Thin wrapper around `google-genai` SDK for Batch API operations. The SDK is synchronous — wrap all calls with `asyncio.to_thread()`.
 
 ```python
-from rerankers import Reranker
+from google import genai
+from google.genai import types
 
-self._ranker = Reranker(model_name, model_type="colbert")
+client = genai.Client()  # Uses GEMINI_API_KEY env var
 ```
 
-The model is ~130MB, 33M parameters, loads in ~2-3 seconds on CPU. Load once, reuse.
+**`GeminiClient.__init__(api_key=None)`** — creates `genai.Client`. If api_key is None, reads from `GEMINI_API_KEY` env var.
 
-**`ColBERTReranker.rerank(query: str, candidates: list[tuple[str, str]], top_n: int = COLBERT_TOP_N) → list[tuple[str, float]]`**
+**`GeminiClient.submit_batch(requests, display_name) → str`** — submits inline batch requests, returns job name. Uses `client.batches.create(model=GEMINI_MODEL, src=requests, config={"display_name": display_name})`.
 
-Rerank candidate notes using ColBERT MaxSim scoring.
+**`GeminiClient.poll_until_done(job_name, poll_interval, max_time) → BatchJob`** — polls `client.batches.get()` until terminal state. Returns the job object.
 
-Parameters:
-- `query`: The user's search query.
-- `candidates`: List of `(note_id, note_content)` tuples.
-- `top_n`: Return only the top N results.
+**`GeminiClient.get_results(job) → list[dict]`** — extracts results from completed job. Handles both inline responses and file-based results.
+
+**Job states**: `JOB_STATE_SUCCEEDED`, `JOB_STATE_FAILED`, `JOB_STATE_CANCELLED`, `JOB_STATE_EXPIRED`.
+
+### Dreamer Prompts (prompts.py)
+
+System prompts for each Dreamer task, as string constants. All require JSON output format.
+
+**`LINK_GENERATION_PROMPT`** — given a set of notes, identify which pairs should be linked, with link type and strength. Return `{"links": [{"source_id": ..., "target_id": ..., "link_type": ..., "strength": ...}]}`.
+
+**`PATTERN_DETECTION_PROMPT`** — given notes across sessions, identify cross-session trends, behavioral patterns. Return `{"patterns": [{"content": ..., "keywords": [...], "supporting_note_ids": [...]}]}`. Output notes are tagged `note_type: "inference"`, `provenance: "inferred"`.
+
+**`CONTRADICTION_DETECTION_PROMPT`** — given pairs of notes with cosine > 0.80, determine if they contradict. Return `{"contradictions": [{"note_id_a": ..., "note_id_b": ..., "description": ...}]}`. Creates `"contradicts"` links.
+
+**`PROFILE_UPDATE_PROMPT`** — given permanent notes and current profile, regenerate the static profile. Return `{"profile": {"identity": [...], "professional": [...], "communication_style": [...], "relationships": [...]}}`.
+
+### Task Builder (task_builder.py)
+
+Constructs Gemini Batch API request payloads from post-dedup notes.
+
+**`build_link_requests(notes, existing_links) → list[dict]`** — creates batch requests for link generation. Groups notes into batches of ~20.
+
+**`build_pattern_requests(notes, sessions) → list[dict]`** — creates batch requests for pattern detection across sessions.
+
+**`build_contradiction_requests(candidate_pairs) → list[dict]`** — takes pairs of notes with cosine > 0.80, creates batch requests.
+
+**`build_profile_request(permanent_notes, current_profile) → dict`** — single request for profile regeneration.
+
+Each function returns request dicts in the format expected by `GeminiClient.submit_batch()`:
+```python
+{
+    "contents": [{"parts": [{"text": prompt}], "role": "user"}],
+    "system_instruction": {"parts": [{"text": system_prompt}]},
+    "generation_config": {"temperature": temp, "response_mime_type": "application/json"},
+}
+```
+
+### Processor (processor.py)
+
+Processes Gemini batch results back into SQLite/Zvec.
+
+**`DreamerProcessor.__init__(db, embedder, zvec)`**
+
+**`DreamerProcessor.process_links(results) → int`** — parses link JSON, creates links in SQLite. Returns count created. Skips duplicates (UNIQUE constraint).
+
+**`DreamerProcessor.process_patterns(results, peer_id) → int`** — creates inference notes from detected patterns. Tags with `note_type="inference"`, `provenance="inferred"`, `durability="contextual"`. Embeds and stores in Zvec. Returns count created.
+
+**`DreamerProcessor.process_contradictions(results) → int`** — creates `"contradicts"` links between conflicting notes. Returns count created.
+
+**`DreamerProcessor.process_profile(result, peer_id)`** — updates `peers.static_profile` and `peers.profile_updated_at`.
+
+All processors are best-effort: failures are logged, never block the cycle.
+
+### Orchestrator (orchestrator.py)
+
+Coordinates a full Dreamer cycle.
+
+**`DreamerOrchestrator.__init__(db, embedder, zvec, gemini_client, deriver)`**
+
+**`DreamerOrchestrator.run_cycle(peer_id) → CycleResult`**
 
 Steps:
-1. If `len(candidates) <= 1`, return candidates as-is.
-2. Extract the list of document texts from candidates.
-3. Call `self._ranker.rank(query=query, docs=doc_texts)`.
-4. Map `RankedResults` back to note IDs using `.doc_id` (0-indexed position in input list).
-5. Return `list[tuple[note_id, colbert_score]]` sorted by score descending, truncated to `top_n`.
+1. **Dedup**: `DedupProcessor.run(peer_id)`. If 0 notes after dedup → return early.
+2. **Find contradiction candidates**: pairwise cosine among buffered notes where similarity > 0.80.
+3. **Build batch requests**: link generation, pattern detection, contradiction detection, profile update.
+4. **Submit batch**: `gemini_client.submit_batch()`.
+5. **Poll**: `gemini_client.poll_until_done()`.
+6. **Process results**: links → patterns → contradictions → profile.
+7. **MAGMA update**: update entity graph from new/modified notes.
+8. **Return** `CycleResult` with counts.
 
-**Error handling:** If reranking fails, log a warning and return the candidates in their original order.
+`CycleResult` dataclass: `notes_deduped`, `links_created`, `patterns_found`, `contradictions_found`, `profile_updated: bool`.
 
-**`ColBERTReranker.is_loaded() → bool`** — Check if the model loaded successfully.
+If the Gemini batch job fails or times out, log the error and return a partial result (dedup still completes).
 
-### intelligence/profiler.py — Static Profile Generator
+---
 
-Generates a ~30-fact "Peer Card" from permanent notes via the existing Deriver API (DeepSeek V3.2). Called periodically or on-demand. Not user-facing.
+## MAGMA Multi-Graph (graph/magma.py)
 
-**`Profiler.__init__(db: SQLiteStore, deriver: Deriver)`** — Stores references.
+Three orthogonal graphs stored in NetworkX, persisted to SQLite via `entity_mentions` table and `links` table.
 
-**`Profiler.generate(peer_id: str) → PeerProfile | None`**
+**Entity graph**: nodes = entities (people, places, organizations, concepts), edges = co-occurrence in notes. Weight = number of shared notes.
 
-Steps:
-1. **Check minimum**: `db.get_permanent_notes(peer_id)` → if fewer than `PROFILE_MIN_NOTES`, return `None`.
-2. **Collect input**: Take up to 50 permanent notes, sorted by importance DESC.
-3. **Call Deriver API**: Use `deriver._call_api()` with the profile-generation system prompt and note texts as user content.
-4. **Parse response**: Expect JSON with keys matching `PROFILE_SECTIONS`.
-5. **Upsert**: `db.upsert_profile(peer_id, sections, fact_count, source_note_ids)`.
-6. **Return** the `PeerProfile`.
+**Temporal graph**: stored via `links` with `link_type="temporal"`. Nodes = notes, edges = temporal ordering within sessions.
 
-**Profile generation system prompt:**
+**Causal graph**: stored via `links` with `link_type="causal"`. Created by the Dreamer.
 
-```python
-PROFILE_SYSTEM_PROMPT = """\
-You generate a concise static profile (Peer Card) from a collection of permanent facts \
-about a person.
+### magma.py Methods
 
-Organize the facts into exactly these sections:
-- identity: name, age, location, key personal identifiers
-- professional: role, company, industry (do NOT include skill level or expertise — \
-those belong in dynamic memory)
-- communication_style: preferred tone, formality, response length preferences
-- relationships: important people, pets, family mentions
+**`MAGMAGraph.__init__(db)`** — initializes empty NetworkX graphs.
 
-Rules:
-- Maximum 30 facts total across all sections.
-- Each fact is one short sentence.
-- Omit sections with no relevant facts (return empty string for that section).
-- Prioritize facts with higher importance scores.
-- Do NOT infer or hallucinate — only include facts directly supported by the input notes.
+**`MAGMAGraph.load(peer_id)`** — loads entity mentions from SQLite, builds in-memory NetworkX graph.
 
-Return JSON: {"identity": "...", "professional": "...", "communication_style": "...", \
-"relationships": "..."}
-"""
-```
+**`MAGMAGraph.extract_entities(text) → list[tuple[str, str]]`** — rule-based entity extraction (no LLM). Returns list of (entity_name, entity_type) tuples. Uses simple heuristics: capitalized multi-word sequences → person/organization, @-patterns → person, known location patterns → place. Best-effort; failure returns empty list.
 
-**Error handling:** If the API call fails, log a warning and return `None`.
+**`MAGMAGraph.add_note_entities(note, entities)`** — adds entity mentions to SQLite and updates in-memory graph.
 
-**`Profiler.get_profile_text(peer_id: str) → str | None`**
+**`MAGMAGraph.get_related_entities(entity_name, peer_id, top_k=10) → list[str]`** — returns entities most connected to the given entity via graph centrality.
 
-Fetch the profile from SQLite and format as text for system prompt injection:
+**`MAGMAGraph.get_entity_subgraph(entity_name, depth=2) → dict`** — BFS from entity node, returns subgraph as adjacency dict.
 
-```
-## About {peer_name}
-### Identity
-{identity facts}
-### Professional
-{professional facts}
-### Communication Style
-{communication_style facts}
-### Relationships
-{relationships facts}
-```
+**`MAGMAGraph.get_communities(peer_id) → list[list[str]]`** — community detection (Louvain or label propagation) on the entity graph. Returns groups of related entities.
 
-Returns `None` if no profile exists.
+Entity extraction is called from `handle_derive()` after note creation. It runs synchronously and is best-effort — extraction failure never blocks note creation.
 
-### intelligence/__init__.py
+---
+
+## Models
+
+### RetrievalResult (models.py)
 
 ```python
-from mnemosyne.intelligence.linker import Linker
-from mnemosyne.intelligence.reranker import ColBERTReranker
-from mnemosyne.intelligence.profiler import Profiler
-
-
-def create_linker(db, zvec, embedder) -> Linker:
-    return Linker(db=db, zvec=zvec, embedder=embedder)
-
-
-def create_reranker() -> ColBERTReranker:
-    return ColBERTReranker()
-
-
-def create_profiler(db, deriver) -> Profiler:
-    return Profiler(db=db, deriver=deriver)
-
-
-__all__ = [
-    "ColBERTReranker", "Linker", "Profiler",
-    "create_linker", "create_profiler", "create_reranker",
-]
+class RetrievalResult(BaseModel):
+    note: Note
+    score: float              # Final composite score
+    rrf_score: float          # Raw RRF before multipliers
+    decay_strength: float
+    provenance_weight: float
+    fatigue_factor: float
+    source: str               # "fts" | "vector" | "both" | "link"
 ```
 
 ---
@@ -611,134 +594,73 @@ __all__ = [
 |------|--------|-------|
 | Fast path (write + enqueue) | < 5ms | User never waits past this |
 | Full async write pipeline | < 5s | Not user-facing |
-| Link generation (write path) | < 50ms | Zvec search + SQLite inserts. Not user-facing. |
 | FTS5 search | < 1ms | SQLite in-process |
 | Zvec vector search | ~2-5ms | HNSW in-process |
 | Query embedding | ~10ms | Single call |
-| Link expansion | < 5ms | SQLite queries only |
 | RRF + scoring | < 1ms | Pure math, ~60 candidates |
-| MMR dedup | ~20-50ms | Batch embed + dot products (Phase 3 fallback) |
-| ColBERT reranking (30 candidates) | < 30ms | CPU, short texts (~20-50 words each) |
-| Profile generation | < 5s | LLM call, not user-facing. Background task. |
-| **Full retrieval (Phase 3, no ColBERT)** | **< 80ms** | **User-facing** |
-| **Full retrieval (Phase 4, with ColBERT)** | **< 120ms** | **User-facing** |
+| ColBERT rerank | ~5-7ms | Query encode ~5ms + MaxSim ~1-2ms (pre-computed docs) |
+| MMR dedup | ~20-50ms | Batch embed + dot products |
+| **Full retrieval (with ColBERT)** | **< 100ms** | **User-facing, pre-computed tokens** |
+| **Full retrieval (without ColBERT)** | **< 80ms** | **Fallback** |
+| Batch dedup (100 notes) | ~100ms | Start of Dreamer cycle |
+| Dreamer cycle | < 24h | Batch API SLO, typically much faster |
 
 ---
 
 ## Environment Variables
 
 ```bash
-export NOUSRESEARCH_API_KEY="your-key"   # Required for Phase 2 Deriver + Phase 4 Profiler
+export NOUSRESEARCH_API_KEY="your-key"   # Required for Deriver
+export GEMINI_API_KEY="your-key"         # Required for Dreamer
 ```
-
-No new env vars for Phases 3-4. The ColBERT model (`answerdotai/answerai-colbert-small-v1`) downloads automatically on first load (~130MB from HuggingFace).
-
----
-
-## Critical Library Notes
-
-### rerankers (v0.10.0+) — Phase 4
-
-```python
-from rerankers import Reranker
-
-# Load ColBERT model (one-time, ~2-3s on CPU, ~130MB)
-ranker = Reranker("answerdotai/answerai-colbert-small-v1", model_type="colbert")
-
-# Rerank documents
-results = ranker.rank(query="What pets does the user have?", docs=["User has a cat", "User likes hiking"])
-
-# Access results
-for r in results.results:
-    print(r.doc_id, r.score, r.text)
-# r.doc_id is the 0-indexed position in the original docs list
-```
-
-- `model_type="colbert"` is REQUIRED. Without it, rerankers may misidentify the model.
-- The `rank()` method returns a `RankedResults` object. Access `.results` for the list of `Result` objects.
-- Each `Result` has: `.doc_id` (int, 0-indexed position), `.score` (float), `.text` (str).
-- CPU inference is fine for 20-50 short text candidates (~20ms).
-- Install with: `pip install "rerankers[transformers]"` (needs the transformers extra for local models).
-
-### Zvec score semantics
-
-Zvec's `query()` returns results with a `.score` field. For HNSW with L2-normalized vectors (which nomic-embed produces), the score represents inner product similarity (higher = more similar). Since our embeddings are L2-normalized, inner product = cosine similarity. Use the score directly for the link threshold comparison in the Linker.
 
 ---
 
 ## Tests
 
-All use `tmp_path`. All API calls mocked. Expensive models (embedder, ColBERT) use `scope="module"` fixtures.
+All use `tmp_path`. All API calls mocked.
 
-### Phase 1
+### Foundation
 - **test_sqlite_store.py**: schema, CRUD, FTS5 triggers, task queue atomic dequeue, dead-letter.
-- **test_models.py**: Pydantic model construction, from_row, JSON parsing, defaults.
 - **test_embedder.py**: 384-dim, deterministic, doc vs query prefix produces different vectors.
 - **test_zvec_store.py**: insert+query, batch, delete, empty query.
 - **test_memory_api.py**: full round trip peer→session→message→note→search (keyword, vector, hybrid).
 
-### Phase 2
+### Write Pipeline
 - **test_worker.py**: run_once, empty queue, exception handling, dead-letter.
 - **test_intake.py**: user enqueues, assistant doesn't, preceding context, FTS5 findable.
 - **test_deriver.py**: extraction, confirmation, empty, scorer fields, retry on 429, garbage JSON.
 - **test_write_pipeline.py**: full round trip ingest→derive→notes in SQLite+Zvec+FTS5.
 
-### Phase 3
-- **test_scorer.py**: Pure unit tests. decay disabled < 100 memories. decay ramps 100–1000. high-importance floor. provenance weights match config. fatigue monotonically decreasing. composite multiplies all factors.
-- **test_fusion.py**: RRF scores overlapping > non-overlapping. MMR drops similarity > 0.90, keeps orthogonal. Order preserved. Missing embeddings auto-accepted.
-- **test_retriever.py**: basic retrieval, FTS+vector overlap gets source="both", peer isolation, access tracking updates, empty results, Zvec failure fallback, FTS failure fallback, MMR dedup of near-identical notes, provenance ordering, decay ordering, result limit respected.
-- **test_retrieval_pipeline.py**: end-to-end write-then-read. Multiple sessions. Surfacing fatigue increases across repeated queries. Mixed provenance ordering.
+### Retrieval
+- **test_scorer.py**: decay disabled < 100, ramps 100–1000, high-importance floor, provenance weights, fatigue decreasing, composite multiplies.
+- **test_fusion.py**: RRF overlapping > non-overlapping, MMR drops > 0.90, order preserved, missing embeddings auto-accepted.
+- **test_retriever.py**: basic retrieval, source="both", peer isolation, access tracking, empty results, fallbacks, MMR dedup, provenance/decay ordering, limit respected.
+- **test_retrieval_pipeline.py**: end-to-end write-then-read, multiple sessions, surfacing fatigue, mixed provenance.
 
-### Phase 4
-- **test_linker.py**:
-  - test_creates_semantic_links: Insert 3 similar notes → linker creates links between them with strength ≥ threshold.
-  - test_no_links_below_threshold: Insert 2 unrelated notes → linker creates no links.
-  - test_self_link_excluded: The note itself does not appear in link candidates.
-  - test_peer_isolation: Notes from different peers do not get linked.
-  - test_duplicate_link_skipped: Running linker twice on the same note does not raise or create duplicate links.
-  - test_zvec_failure_graceful: Zvec search failure → returns [], no crash.
-  - test_find_neighbors: Create notes with links → find_neighbors() returns linked notes sorted by strength.
+### Intelligence Layer
+- **test_link_generator.py**: generates links above threshold, skips below, caps at max per note, bidirectional query works, no duplicate links.
+- **test_colbert_reranker.py**: encode_document returns bytes of correct shape, rerank with pre-computed tokens returns reranked ids, graceful failure returns original order, notes without tokens ranked at end, top_n respected.
+- **test_profile_generator.py**: generates valid 4-section profile, stores in peer, skips empty notes, no expertise in profile.
 
-- **test_reranker.py**:
-  - test_reranks_candidates: Given a query and 5 candidates, reranker returns them reordered by ColBERT score.
-  - test_single_candidate_passthrough: 1 candidate → returned as-is.
-  - test_empty_candidates: 0 candidates → returns [].
-  - test_top_n_truncation: 10 candidates, top_n=3 → returns exactly 3.
-  - test_scores_are_floats: All returned scores are float.
-  - test_relevant_ranked_higher: Query "cats and dogs" with candidates including one about pets → pet candidate ranked in top 3.
-
-- **test_profiler.py**:
-  - test_generates_profile: Mock Deriver → profile has all 4 sections, stored in SQLite.
-  - test_skips_below_min_notes: Peer with < 5 permanent notes → returns None.
-  - test_profile_text_format: Generated text includes section headers and facts.
-  - test_updates_existing_profile: Second generation replaces the first.
-  - test_api_failure_returns_none: Deriver fails → returns None, no crash.
-
-- **test_link_expansion.py**:
-  - test_linked_notes_added_to_results: Create 3 linked notes → retrieval for one returns linked neighbors.
-  - test_expansion_respects_depth: Depth=1 → only direct neighbors, not neighbors-of-neighbors.
-  - test_expansion_respects_max: More than LINK_EXPANSION_MAX neighbors → only top N by strength included.
-  - test_no_links_no_expansion: Note with no links → retrieval results unchanged.
-  - test_link_source_tag: Link-expanded notes have source containing "link".
-
-- **test_intelligence_pipeline.py**:
-  - test_full_write_with_links: Ingest message → derive → notes created → links generated between similar notes.
-  - test_retrieval_with_colbert: Add notes → retrieve with ColBERT reranker → results have colbert_score set.
-  - test_retrieval_colbert_fallback: ColBERT unavailable → retrieval still works (Phase 3 behavior).
-  - test_profile_generation_round_trip: Create peer → add permanent notes → generate profile → retrieve profile text.
-  - test_link_expansion_in_retrieval: Create linked notes → retrieve → linked notes appear in results with "link" source.
+### Background Processes
+- **test_dedup.py**: clusters similar notes, merges canonical, sums evidence_count, computes importance, handles single notes, handles no buffered notes, union-find correctness.
+- **test_gemini_client.py**: submit_batch returns job name, poll_until_done handles states (success/fail/expired), get_results parses inline and file responses. All calls mocked.
+- **test_dreamer_orchestrator.py**: full cycle mock (dedup → submit → poll → process), handles empty buffer, handles batch failure gracefully, partial results on timeout.
+- **test_magma.py**: extract_entities finds capitalized names, add_note_entities persists to SQLite, get_related_entities returns connected nodes, get_communities returns groups, empty graph returns empty lists.
+- **test_dreamer_pipeline.py**: end-to-end with mocked Gemini — buffer notes → dedup → dream → verify links/patterns/profile created. Entity mentions stored. Contradictions create links.
 
 ---
 
 ## Design Principles
 
-1. **User never waits for memory processing.** Write path is async; read path is < 120ms (< 80ms without ColBERT).
-2. **Raw data is immutable.** Stream 1 observations are ground truth.
+1. **User never waits for memory processing.** Write path is async; read path is < 100ms.
+2. **Raw data is immutable.** Stream 1 observations are ground truth. Dreamer creates Stream 3 inferences, never modifies Stream 1.
 3. **Frequency ≠ importance.** Two-dimensional scoring prevents topic domination.
 4. **Decay scores, never deletes.** All data preserved; relevance is temporal.
 5. **Agent responses are context, not memory.** Read but never stored as user attributes.
-6. **Graceful degradation everywhere.** If one component fails, others still return results. Zvec down → no links. ColBERT down → composite scoring with MMR. Deriver down → no profile. Link generation down → write pipeline continues.
-7. **No LLM calls in the read path** (Phases 3–4). ColBERT and link expansion are pure local computation. Profile generation is a background task.
-8. **Semantic links only in Phase 4.** Causal, temporal, and contradiction links are Phase 5 (Dreamer). The link_type field and infrastructure exist, but Phase 4 only creates "semantic" links.
-9. **Profile excludes expertise.** Per the architecture spec, expertise/skill level is NOT in the static profile. It stays in dynamic memory to prevent model over-anchoring.
-10. **ColBERT is optional.** The retriever works without ColBERT (falls back to Phase 3 MMR dedup). This allows deployment without the extra model.
+6. **Graceful degradation.** If one search backend or the Dreamer fails, the system continues.
+7. **No LLM calls in the read path.** ColBERT is a local model, not an API call.
+8. **No expertise in static profile.** Prevents model over-anchoring. Expertise lives in dynamic notes.
+9. **Batch dedup before Dreamer.** Preserves frequency as an importance signal while preventing the Dreamer from being overwhelmed by repetition.
+10. **Entity extraction is best-effort.** Rule-based, no LLM. Failure never blocks note creation.
