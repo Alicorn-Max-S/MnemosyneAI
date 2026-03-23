@@ -13,7 +13,7 @@ class TestSchema:
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )
         tables = {row[0] for row in await cursor.fetchall()}
-        expected = {"config", "peers", "sessions", "messages", "notes", "links", "task_queue", "notes_fts"}
+        expected = {"config", "peers", "sessions", "messages", "notes", "links", "task_queue", "notes_fts", "peer_profiles", "entity_mentions", "colbert_tokens"}
         assert expected.issubset(tables)
 
     async def test_indexes_created(self, store):
@@ -376,3 +376,177 @@ class TestTaskQueue:
         assert result.status == "dead_letter"
         assert result.error == "error 2"
         assert result.completed_at is not None
+
+
+# ── Entity Mentions ────────────────────────────────────────────────
+
+
+class TestEntityMentions:
+    async def test_add_and_get(self, store):
+        peer = await store.create_peer("Alice")
+        note = await store.create_note(peer.id, "Met with Bob today")
+        mention = await store.add_entity_mention(
+            note.id, peer.id, "Bob", "person", "Met with Bob today"
+        )
+        assert mention["entity_name"] == "Bob"
+        assert mention["entity_type"] == "person"
+        assert mention["note_id"] == note.id
+
+        mentions = await store.get_entity_mentions(peer.id, "Bob")
+        assert len(mentions) == 1
+        assert mentions[0]["mention_context"] == "Met with Bob today"
+
+    async def test_get_entities_for_peer(self, store):
+        peer = await store.create_peer("Alice")
+        n1 = await store.create_note(peer.id, "Bob is a developer")
+        n2 = await store.create_note(peer.id, "Acme Corp is great")
+        await store.add_entity_mention(n1.id, peer.id, "Bob", "person")
+        await store.add_entity_mention(n2.id, peer.id, "Acme Corp", "organization")
+
+        entities = await store.get_entities_for_peer(peer.id)
+        assert len(entities) == 2
+        names = {e["entity_name"] for e in entities}
+        assert names == {"Bob", "Acme Corp"}
+
+    async def test_peer_isolation(self, store):
+        p1 = await store.create_peer("Alice")
+        p2 = await store.create_peer("Bob")
+        n1 = await store.create_note(p1.id, "Entity X")
+        n2 = await store.create_note(p2.id, "Entity X")
+        await store.add_entity_mention(n1.id, p1.id, "Entity X", "other")
+        await store.add_entity_mention(n2.id, p2.id, "Entity X", "other")
+
+        mentions_p1 = await store.get_entity_mentions(p1.id, "Entity X")
+        mentions_p2 = await store.get_entity_mentions(p2.id, "Entity X")
+        assert len(mentions_p1) == 1
+        assert len(mentions_p2) == 1
+        assert mentions_p1[0]["peer_id"] == p1.id
+        assert mentions_p2[0]["peer_id"] == p2.id
+
+
+# ── ColBERT Tokens ─────────────────────────────────────────────────
+
+
+class TestColbertTokens:
+    async def test_store_and_get_roundtrip(self, store):
+        peer = await store.create_peer("Alice")
+        note = await store.create_note(peer.id, "Test note")
+        blob = b"\x00\x01\x02\x03" * 96
+        await store.store_colbert_tokens(note.id, blob, 4)
+
+        result = await store.get_colbert_tokens([note.id])
+        assert note.id in result
+        assert result[note.id] == blob
+
+    async def test_missing_ids_omitted(self, store):
+        result = await store.get_colbert_tokens(["nonexistent_id"])
+        assert result == {}
+
+    async def test_empty_list(self, store):
+        result = await store.get_colbert_tokens([])
+        assert result == {}
+
+    async def test_replace_on_duplicate(self, store):
+        peer = await store.create_peer("Alice")
+        note = await store.create_note(peer.id, "Test note")
+        blob1 = b"\x00" * 384
+        blob2 = b"\xff" * 384
+        await store.store_colbert_tokens(note.id, blob1, 4)
+        await store.store_colbert_tokens(note.id, blob2, 8)
+
+        result = await store.get_colbert_tokens([note.id])
+        assert result[note.id] == blob2
+
+    async def test_batch_get_multiple(self, store):
+        peer = await store.create_peer("Alice")
+        n1 = await store.create_note(peer.id, "Note 1")
+        n2 = await store.create_note(peer.id, "Note 2")
+        blob1 = b"\x01" * 100
+        blob2 = b"\x02" * 200
+        await store.store_colbert_tokens(n1.id, blob1, 2)
+        await store.store_colbert_tokens(n2.id, blob2, 3)
+
+        result = await store.get_colbert_tokens([n1.id, n2.id])
+        assert len(result) == 2
+        assert result[n1.id] == blob1
+        assert result[n2.id] == blob2
+
+
+# ── Merge Notes ────────────────────────────────────────────────────
+
+
+class TestMergeNotes:
+    async def test_canonical_note_id_set_on_merged(self, store):
+        peer = await store.create_peer("Alice")
+        canonical = await store.create_note(peer.id, "Canonical", importance=0.9)
+        merged1 = await store.create_note(peer.id, "Dup 1", importance=0.3)
+        merged2 = await store.create_note(peer.id, "Dup 2", importance=0.2)
+
+        await store.merge_notes(canonical.id, [merged1.id, merged2.id])
+
+        m1 = await store.get_note(merged1.id)
+        m2 = await store.get_note(merged2.id)
+        assert m1.canonical_note_id == canonical.id
+        assert m2.canonical_note_id == canonical.id
+
+    async def test_is_buffered_cleared_on_all(self, store):
+        peer = await store.create_peer("Alice")
+        canonical = await store.create_note(peer.id, "Canonical", is_buffered=True)
+        merged = await store.create_note(peer.id, "Dup", is_buffered=True)
+
+        await store.merge_notes(canonical.id, [merged.id])
+
+        c = await store.get_note(canonical.id)
+        m = await store.get_note(merged.id)
+        assert c.is_buffered is False
+        assert m.is_buffered is False
+
+    async def test_evidence_count_summed(self, store):
+        peer = await store.create_peer("Alice")
+        canonical = await store.create_note(peer.id, "Canonical")  # evidence_count=1
+        merged1 = await store.create_note(peer.id, "Dup 1")  # evidence_count=1
+        merged2 = await store.create_note(peer.id, "Dup 2")  # evidence_count=1
+
+        await store.merge_notes(canonical.id, [merged1.id, merged2.id])
+
+        c = await store.get_note(canonical.id)
+        assert c.evidence_count == 3  # 1 (original) + 1 + 1 (merged)
+
+    async def test_canonical_has_no_canonical_note_id(self, store):
+        peer = await store.create_peer("Alice")
+        canonical = await store.create_note(peer.id, "Canonical")
+        merged = await store.create_note(peer.id, "Dup")
+
+        await store.merge_notes(canonical.id, [merged.id])
+
+        c = await store.get_note(canonical.id)
+        assert c.canonical_note_id is None
+
+
+# ── Get Unique Sessions ───────────────────────────────────────────
+
+
+class TestGetUniqueSessions:
+    async def test_counts_distinct_sessions(self, store):
+        peer = await store.create_peer("Alice")
+        s1 = await store.create_session(peer.id)
+        s2 = await store.create_session(peer.id)
+        n1 = await store.create_note(peer.id, "Note 1", session_id=s1.id)
+        n2 = await store.create_note(peer.id, "Note 2", session_id=s1.id)
+        n3 = await store.create_note(peer.id, "Note 3", session_id=s2.id)
+
+        count = await store.get_unique_sessions_for_notes([n1.id, n2.id, n3.id])
+        assert count == 2
+
+    async def test_null_sessions_excluded(self, store):
+        peer = await store.create_peer("Alice")
+        s1 = await store.create_session(peer.id)
+        n1 = await store.create_note(peer.id, "With session", session_id=s1.id)
+        n2 = await store.create_note(peer.id, "No session")  # session_id=None
+
+        count = await store.get_unique_sessions_for_notes([n1.id, n2.id])
+        assert count == 1
+
+    async def test_empty_list_returns_zero(self, store):
+        count = await store.get_unique_sessions_for_notes([])
+        assert count == 0

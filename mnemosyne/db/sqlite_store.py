@@ -163,6 +163,23 @@ class SQLiteStore:
                 generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 source_note_ids TEXT NOT NULL DEFAULT '[]'
             );
+
+            CREATE TABLE IF NOT EXISTS entity_mentions (
+                id TEXT PRIMARY KEY,
+                note_id TEXT NOT NULL REFERENCES notes(id),
+                peer_id TEXT NOT NULL REFERENCES peers(id),
+                entity_name TEXT NOT NULL,
+                entity_type TEXT NOT NULL DEFAULT 'other',
+                mention_context TEXT,
+                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS colbert_tokens (
+                note_id TEXT PRIMARY KEY REFERENCES notes(id),
+                token_embeddings BLOB NOT NULL,
+                num_tokens INTEGER NOT NULL,
+                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
         """)
 
     async def _create_fts(self) -> None:
@@ -210,6 +227,9 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_note_id);
             CREATE INDEX IF NOT EXISTS idx_links_type ON links(link_type);
             CREATE INDEX IF NOT EXISTS idx_task_queue_status_priority ON task_queue(status, priority DESC);
+            CREATE INDEX IF NOT EXISTS idx_entity_mentions_peer_id ON entity_mentions(peer_id);
+            CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity_name ON entity_mentions(entity_name);
+            CREATE INDEX IF NOT EXISTS idx_entity_mentions_note_id ON entity_mentions(note_id);
         """)
 
     # ── Peers ───────────────────────────────────────────────────────
@@ -796,6 +816,133 @@ class SQLiteStore:
         if row is None:
             return None
         return PeerProfile.from_row(dict(row))
+
+    # ── Entity Mentions ────────────────────────────────────────────
+
+    async def add_entity_mention(
+        self,
+        note_id: str,
+        peer_id: str,
+        entity_name: str,
+        entity_type: str = "other",
+        mention_context: str | None = None,
+    ) -> dict:
+        """Insert an entity mention and return the row as a dict."""
+        mention_id = generate_id()
+        await self._db.execute(
+            """INSERT INTO entity_mentions (id, note_id, peer_id, entity_name, entity_type, mention_context)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (mention_id, note_id, peer_id, entity_name, entity_type, mention_context),
+        )
+        await self._db.commit()
+        cursor = await self._db.execute(
+            "SELECT * FROM entity_mentions WHERE id = ?", (mention_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row)
+
+    async def get_entity_mentions(
+        self, peer_id: str, entity_name: str
+    ) -> list[dict]:
+        """Get entity mentions filtered by peer and entity name."""
+        cursor = await self._db.execute(
+            """SELECT * FROM entity_mentions
+               WHERE peer_id = ? AND entity_name = ?
+               ORDER BY created_at""",
+            (peer_id, entity_name),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_entities_for_peer(self, peer_id: str) -> list[dict]:
+        """Get distinct entity names and types for a peer."""
+        cursor = await self._db.execute(
+            """SELECT DISTINCT entity_name, entity_type
+               FROM entity_mentions
+               WHERE peer_id = ?
+               ORDER BY entity_name""",
+            (peer_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # ── ColBERT Tokens ───────────────────────────────────────────
+
+    async def store_colbert_tokens(
+        self, note_id: str, token_embeddings_blob: bytes, num_tokens: int
+    ) -> None:
+        """Store or replace ColBERT token embeddings for a note."""
+        await self._db.execute(
+            """INSERT OR REPLACE INTO colbert_tokens (note_id, token_embeddings, num_tokens)
+               VALUES (?, ?, ?)""",
+            (note_id, token_embeddings_blob, num_tokens),
+        )
+        await self._db.commit()
+
+    async def get_colbert_tokens(self, note_ids: list[str]) -> dict[str, bytes]:
+        """Batch fetch ColBERT token blobs by note IDs. Missing IDs are omitted."""
+        if not note_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in note_ids)
+        cursor = await self._db.execute(
+            f"SELECT note_id, token_embeddings FROM colbert_tokens WHERE note_id IN ({placeholders})",
+            note_ids,
+        )
+        rows = await cursor.fetchall()
+        return {row["note_id"]: row["token_embeddings"] for row in rows}
+
+    # ── Batch Dedup Support ──────────────────────────────────────
+
+    async def merge_notes(
+        self, canonical_id: str, merged_ids: list[str]
+    ) -> None:
+        """Merge notes into a canonical note in a single transaction.
+
+        Sets canonical_note_id on merged notes, sums evidence_count onto
+        the canonical, and clears is_buffered on all involved notes.
+        """
+        if not merged_ids:
+            return
+        placeholders = ", ".join("?" for _ in merged_ids)
+
+        # Sum evidence_count from merged notes
+        cursor = await self._db.execute(
+            f"SELECT COALESCE(SUM(evidence_count), 0) FROM notes WHERE id IN ({placeholders})",
+            merged_ids,
+        )
+        row = await cursor.fetchone()
+        merged_evidence = row[0]
+
+        # Set canonical_note_id on merged notes
+        await self._db.execute(
+            f"UPDATE notes SET canonical_note_id = ?, is_buffered = 0, updated_at = ? WHERE id IN ({placeholders})",
+            [canonical_id, _utcnow(), *merged_ids],
+        )
+
+        # Add merged evidence to canonical and unbuffer it
+        await self._db.execute(
+            """UPDATE notes
+               SET evidence_count = evidence_count + ?,
+                   is_buffered = 0,
+                   updated_at = ?
+               WHERE id = ?""",
+            (merged_evidence, _utcnow(), canonical_id),
+        )
+
+        await self._db.commit()
+
+    async def get_unique_sessions_for_notes(self, note_ids: list[str]) -> int:
+        """Count distinct non-NULL session_ids across the given notes."""
+        if not note_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in note_ids)
+        cursor = await self._db.execute(
+            f"""SELECT COUNT(DISTINCT session_id) FROM notes
+                WHERE id IN ({placeholders}) AND session_id IS NOT NULL""",
+            note_ids,
+        )
+        row = await cursor.fetchone()
+        return row[0]
 
     async def get_permanent_notes(
         self, peer_id: str, limit: int = 50

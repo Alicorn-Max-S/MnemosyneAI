@@ -124,8 +124,7 @@ class TestRetrievalWithColBERT:
 
         # Create a mock reranker that returns controlled scores
         mock_reranker = MagicMock()
-        mock_reranker.is_loaded.return_value = True
-        mock_reranker.rerank.return_value = [(note.id, 0.95)]
+        mock_reranker.rerank = AsyncMock(return_value=[(note.id, 0.95)])
 
         retriever = Retriever(store, zvec, embedder, colbert_reranker=mock_reranker)
         results = await retriever.retrieve("cats tuna", peer.id)

@@ -230,39 +230,44 @@ class Retriever:
         results.sort(key=lambda r: r.score, reverse=True)
 
         # 11. ColBERT reranking OR MMR dedup
-        if self._reranker is not None and self._reranker.is_loaded():
+        if self._reranker is not None:
             try:
                 candidates_for_rerank = results[:COLBERT_RERANK_CANDIDATES]
-                candidate_tuples = [
-                    (r.note.id, r.note.content) for r in candidates_for_rerank
-                ]
-                reranked = await asyncio.to_thread(
-                    self._reranker.rerank, query, candidate_tuples, COLBERT_TOP_N
+                candidate_ids = [r.note.id for r in candidates_for_rerank]
+                reranked = await self._reranker.rerank(
+                    query, candidate_ids, self._db, COLBERT_TOP_N
                 )
                 # Build lookup from rerank results
                 rerank_map = {nid: score for nid, score in reranked}
                 reranked_ids = [nid for nid, _ in reranked]
-                result_map = {r.note.id: r for r in candidates_for_rerank}
 
-                reranked_results: list[RetrievalResult] = []
-                for nid in reranked_ids:
-                    r = result_map.get(nid)
-                    if r is not None:
-                        reranked_results.append(
-                            RetrievalResult(
-                                note=r.note,
-                                score=rerank_map[nid],
-                                composite_score=r.composite_score,
-                                rrf_score=r.rrf_score,
-                                decay_strength=r.decay_strength,
-                                provenance_weight=r.provenance_weight,
-                                fatigue_factor=r.fatigue_factor,
-                                inference_discount=r.inference_discount,
-                                colbert_score=rerank_map[nid],
-                                source=r.source,
+                # If no candidate had pre-computed tokens (all scores 0.0),
+                # fall back to MMR dedup instead of using useless scores.
+                if not any(s > 0.0 for s in rerank_map.values()):
+                    logger.debug("No pre-computed ColBERT tokens, falling back to MMR")
+                    results = await self._mmr_dedup_results(results, vec_set)
+                else:
+                    result_map = {r.note.id: r for r in candidates_for_rerank}
+
+                    reranked_results: list[RetrievalResult] = []
+                    for nid in reranked_ids:
+                        r = result_map.get(nid)
+                        if r is not None:
+                            reranked_results.append(
+                                RetrievalResult(
+                                    note=r.note,
+                                    score=rerank_map[nid],
+                                    composite_score=r.composite_score,
+                                    rrf_score=r.rrf_score,
+                                    decay_strength=r.decay_strength,
+                                    provenance_weight=r.provenance_weight,
+                                    fatigue_factor=r.fatigue_factor,
+                                    inference_discount=r.inference_discount,
+                                    colbert_score=rerank_map[nid],
+                                    source=r.source,
+                                )
                             )
-                        )
-                results = reranked_results
+                    results = reranked_results
             except Exception:
                 logger.warning("ColBERT reranking failed, falling back to MMR dedup")
                 results = await self._mmr_dedup_results(results, vec_set)

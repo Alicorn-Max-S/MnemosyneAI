@@ -15,10 +15,17 @@ def create_worker(
     embedder: Embedder,
     zvec: ZvecStore,
     linker=None,
+    colbert_reranker=None,
+    magma_graph=None,
 ) -> Worker:
     """Create a Worker with the derive handler wired up."""
     async def _handle(task):
-        await handle_derive(task, db, deriver, embedder, zvec, linker=linker)
+        await handle_derive(
+            task, db, deriver, embedder, zvec,
+            linker=linker,
+            colbert_reranker=colbert_reranker,
+            magma_graph=magma_graph,
+        )
     return Worker(db, {"derive": _handle})
 
 

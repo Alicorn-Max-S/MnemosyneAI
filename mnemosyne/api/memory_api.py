@@ -7,6 +7,10 @@ import re
 
 from mnemosyne.config import DEFAULT_DATA_DIR, RRF_K, SQLITE_DB_NAME
 from mnemosyne.db.sqlite_store import SQLiteStore
+from mnemosyne.dreamer import CycleResult, create_dreamer
+from mnemosyne.dreamer.gemini_client import GeminiClient
+from mnemosyne.graph import MAGMAGraph, create_magma_graph
+from mnemosyne.intelligence import create_reranker
 from mnemosyne.models import Message, Note, Peer, RetrievalResult, Session
 from mnemosyne.retrieval import create_retriever
 from mnemosyne.vectors.embedder import Embedder
@@ -29,6 +33,9 @@ class MemoryAPI:
         self._zvec: ZvecStore | None = None
         self._embedder: Embedder | None = embedder
         self._retriever = None
+        self._colbert_reranker = None
+        self._magma_graph: MAGMAGraph | None = None
+        self._dreamer = None
 
     async def initialize(self) -> None:
         """Create stores, load embedder if not injected, and prepare for use."""
@@ -41,7 +48,29 @@ class MemoryAPI:
             self._embedder = await asyncio.to_thread(Embedder)
 
         self._zvec = await asyncio.to_thread(ZvecStore, self.data_dir)
-        self._retriever = create_retriever(self._sqlite, self._zvec, self._embedder)
+
+        # ColBERT reranker (lazy model load on first use)
+        self._colbert_reranker = create_reranker()
+
+        # MAGMA entity graph
+        self._magma_graph = create_magma_graph(self._sqlite)
+
+        # Retriever with ColBERT reranker
+        self._retriever = create_retriever(
+            self._sqlite, self._zvec, self._embedder,
+            colbert_reranker=self._colbert_reranker,
+        )
+
+        # Dreamer (optional — requires GEMINI_API_KEY)
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        if gemini_key:
+            gemini_client = GeminiClient(api_key=gemini_key)
+            self._dreamer = create_dreamer(
+                self._sqlite, self._embedder, self._zvec,
+                gemini_client, deriver=None,
+            )
+            logger.info("Dreamer initialized with Gemini API key")
+
         logger.info("MemoryAPI initialized at %s", self.data_dir)
 
     async def close(self) -> None:
@@ -52,6 +81,9 @@ class MemoryAPI:
         self._zvec = None
         self._embedder = None
         self._retriever = None
+        self._colbert_reranker = None
+        self._magma_graph = None
+        self._dreamer = None
 
     # ── Delegated CRUD ─────────────────────────────────────────────
 
@@ -136,6 +168,36 @@ class MemoryAPI:
     ) -> list[RetrievalResult]:
         """Run the full retrieval pipeline with scoring and dedup."""
         return await self._retriever.retrieve(query, peer_id, limit=limit)
+
+    # ── Dreamer (Phase 5) ──────────────────────────────────────────
+
+    async def run_dreamer_cycle(self, peer_id: str) -> CycleResult:
+        """Run a Dreamer background processing cycle for a peer.
+
+        Raises:
+            RuntimeError: If GEMINI_API_KEY was not set during initialization.
+        """
+        if self._dreamer is None:
+            raise RuntimeError("Dreamer not available (GEMINI_API_KEY not set)")
+        return await self._dreamer.run_cycle(peer_id)
+
+    async def get_entity_graph(self, peer_id: str) -> dict:
+        """Return entity graph data for a peer.
+
+        Returns:
+            Dict with 'entities' (list of dicts) and 'communities' (list of lists).
+        """
+        await self._magma_graph.load(peer_id)
+        communities = self._magma_graph.get_communities(peer_id)
+        entities = await self._sqlite.get_entities_for_peer(peer_id)
+        return {"entities": entities, "communities": communities}
+
+    async def get_static_profile(self, peer_id: str) -> dict | None:
+        """Return the peer's static profile dict, or None if not generated."""
+        peer = await self._sqlite.get_peer(peer_id)
+        if peer is None:
+            return None
+        return peer.static_profile
 
     # ── Search ─────────────────────────────────────────────────────
 
