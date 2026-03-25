@@ -1,6 +1,6 @@
 # Mnemosyne — Spec
 
-AI agent memory system. SQLite + FTS5 + Zvec for storage/search. Async write pipeline (Deriver via DeepSeek V3.2). Retrieval pipeline (parallel search, RRF fusion, scoring, MMR dedup). Intelligence layer (A-MEM links, ColBERT reranking, static profile). Background processes (batch dedup, Dreamer via Gemini 3 Flash Batch API, MAGMA multi-graph).
+AI agent memory system. SQLite + FTS5 + Zvec for storage/search. Async write pipeline (Deriver via DeepSeek V3.2). Retrieval pipeline (parallel search, RRF fusion, scoring, MMR dedup). Intelligence layer (A-MEM links, ColBERT reranking, static profile). Background processes (batch dedup, Dreamer via Gemini 3 Flash Batch API, MAGMA multi-graph). Refinement layer (MemR3 reflective loop, MemRL Q-value tracking, anti-sycophancy guards, adaptive routing, user feedback and memory correction).
 
 ---
 
@@ -14,7 +14,9 @@ mnemosyne/
 ├── mnemosyne/
 │   ├── __init__.py
 │   ├── config.py               # All constants, thresholds, API config
-│   ├── models.py               # Pydantic: Peer, Session, Message, Note, Link, TaskItem, RetrievalResult
+│   ├── models.py               # Pydantic: Peer, Session, Message, Note, Link, TaskItem, RetrievalResult, ReflectiveResult, FeedbackEvent
+│   ├── utils/
+│   │   └── ids.py              # ULID generation
 │   ├── db/
 │   │   └── sqlite_store.py     # All SQLite CRUD, FTS5 search, task queue, access tracking
 │   ├── vectors/
@@ -49,61 +51,48 @@ mnemosyne/
 │   ├── graph/                  # MAGMA multi-graph
 │   │   ├── __init__.py
 │   │   └── magma.py            # Entity extraction, graph operations, link expansion
-│   └── utils/
-│       └── ids.py              # ULID generation
-└── tests/
-    ├── conftest.py
-    ├── test_sqlite_store.py
-    ├── test_zvec_store.py
-    ├── test_embedder.py
-    ├── test_memory_api.py
-    ├── test_worker.py
-    ├── test_intake.py
-    ├── test_deriver.py
-    ├── test_write_pipeline.py
-    ├── test_scorer.py
-    ├── test_fusion.py
-    ├── test_retriever.py
-    ├── test_retrieval_pipeline.py
-    ├── test_link_generator.py
-    ├── test_colbert_reranker.py
-    ├── test_profile_generator.py
-    ├── test_dedup.py
-    ├── test_gemini_client.py
-    ├── test_dreamer_orchestrator.py
-    ├── test_magma.py
-    └── test_dreamer_pipeline.py  # End-to-end: buffer → dedup → dream → links + profile
+│   └── refinement/             # Adaptive retrieval, MemR3, anti-sycophancy
+│       ├── __init__.py         # create_router(), create_reflective_retriever()
+│       ├── router.py           # Simple vs complex query classification
+│       ├── reflective.py       # MemR3 evidence-gap tracker + retrieve/reflect/answer loop
+│       ├── qvalue.py           # MemRL Q-value tracking + Bellman updates
+│       ├── feedback.py         # User feedback ingestion (explicit + implicit signals)
+│       ├── antisycophancy.py   # Epsilon-greedy exploration, topic cluster cap, prompt injection
+│       └── correction.py       # Memory correction flow (invalidate + replace)
+├── tests/
+│   ├── conftest.py
+│   ├── test_sqlite_store.py
+│   ├── test_embedder.py
+│   ├── test_zvec_store.py
+│   ├── test_memory_api.py
+│   ├── test_worker.py
+│   ├── test_intake.py
+│   ├── test_deriver.py
+│   ├── test_write_pipeline.py
+│   ├── test_scorer.py
+│   ├── test_fusion.py
+│   ├── test_retriever.py
+│   ├── test_retrieval_pipeline.py
+│   ├── test_reranker.py
+│   ├── test_linker.py
+│   ├── test_profiler.py
+│   ├── test_link_expansion.py
+│   ├── test_intelligence_pipeline.py
+│   ├── test_dedup.py
+│   ├── test_gemini_client.py
+│   ├── test_dreamer_orchestrator.py
+│   ├── test_magma.py
+│   ├── test_dreamer_pipeline.py
+│   ├── test_qvalue.py
+│   ├── test_reflective.py
+│   ├── test_router.py
+│   ├── test_feedback.py
+│   ├── test_correction.py
+│   ├── test_antisycophancy.py
+│   └── test_refinement_pipeline.py
 ```
 
----
-
-## Dependencies
-
-```toml
-[project]
-name = "mnemosyne"
-version = "0.5.0"
-requires-python = ">=3.11"
-dependencies = [
-    "aiosqlite>=0.20.0",
-    "zvec>=0.2.0",
-    "sentence-transformers[onnx]>=5.0.0",
-    "onnxruntime>=1.18.0",
-    "einops>=0.8.0",
-    "httpx>=0.27.0",
-    "pydantic>=2.0.0",
-    "python-ulid>=3.0.0",
-    "numpy>=1.26.0",
-    "pylate>=1.3.0",
-    "google-genai>=1.0.0",
-    "networkx>=3.0",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
-```
-
-Do NOT add fastapi, uvicorn, ragatouille, or rerankers. Those are not needed.
+No FastAPI, no Celery, no Redis, no Postgres, no Docker Compose needed for the core system. Those are not needed.
 
 ---
 
@@ -208,6 +197,42 @@ DREAMER_PROFILE_TEMPERATURE = 0.1
 ENTITY_GRAPH_NAME = "entity"
 TEMPORAL_GRAPH_NAME = "temporal"
 CAUSAL_GRAPH_NAME = "causal"
+
+# MemRL Q-value tracking
+QVALUE_DEFAULT = 0.0
+QVALUE_LEARNING_RATE = 0.1
+QVALUE_POSITIVE_REWARD = 1.0
+QVALUE_NEGATIVE_REWARD = -0.5
+QVALUE_IMPLICIT_POSITIVE = 0.05
+QVALUE_IMPLICIT_NEGATIVE = -0.05
+QVALUE_WEIGHT_IN_COMPOSITE = 0.15
+QVALUE_ZSCORE_WINDOW = 100
+QVALUE_ZSCORE_MIN_SAMPLES = 10
+
+# Adaptive retrieval routing
+ROUTER_SIMPLE_THRESHOLD = 0.6
+ROUTER_COMPLEX_BUDGET = 3
+ROUTER_DISTANCE_PERCENTILE = 75
+ROUTER_MIN_CANDIDATES = 3
+
+# MemR3 reflective loop
+MEMR3_MAX_ITERATIONS = 3
+MEMR3_EVIDENCE_CONFIDENCE_THRESHOLD = 0.7
+MEMR3_MASK_THRESHOLD = 0.85
+MEMR3_REFLECT_MODEL = "deepseek/deepseek-v3.2"
+MEMR3_REFLECT_TEMPERATURE = 0.1
+MEMR3_REFLECT_MAX_RETRIES = 2
+
+# Anti-sycophancy
+ANTISYC_TOPIC_CLUSTER_CAP = 0.4
+ANTISYC_EPSILON = 0.1
+ANTISYC_AGENT_TOPIC_DECAY_SESSIONS = 3
+ANTISYC_CLUSTER_SIMILARITY = 0.75
+
+# Feedback
+FEEDBACK_CORRECTION_CONFIDENCE = 0.3
+FEEDBACK_REPLACEMENT_PROVENANCE = "user_confirmed"
+FEEDBACK_SESSION_WINDOW = 10
 ```
 
 ---
@@ -223,7 +248,7 @@ PRAGMA foreign_keys=ON;
 
 All PKs are TEXT (ULIDs). Timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
 
-**Tables:** config, peers, sessions, messages, notes, links, task_queue, entity_mentions. See `sqlite_store.py` for full DDL. The critical table is **notes**:
+**Tables:** config, peers, sessions, messages, notes, links, task_queue, peer_profiles, entity_mentions, colbert_tokens, feedback_events, agent_topic_tracker. See `sqlite_store.py` for full DDL. The critical table is **notes**:
 
 | Column group | Columns |
 |---|---|
@@ -234,6 +259,7 @@ All PKs are TEXT (ULIDs). Timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
 | Frequency | evidence_count, unique_sessions_mentioned |
 | Retrieval state | q_value, access_count, last_accessed_at, times_surfaced, decay_score |
 | Pipeline state | is_buffered, canonical_note_id, zvec_id |
+| Correction state | is_invalidated, invalidated_by, correction_of |
 | Timestamps | created_at, updated_at |
 
 **entity_mentions** — tracks entities extracted from notes for the MAGMA entity graph:
@@ -256,6 +282,32 @@ All PKs are TEXT (ULIDs). Timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
 | token_embeddings | BLOB | Serialized numpy array of shape (num_tokens, 96) |
 | num_tokens | INTEGER | Number of tokens (for quick size checks without deserializing) |
 | created_at | TEXT | Timestamp |
+
+**feedback_events** — tracks all user feedback signals:
+
+| Column | Type | Description |
+|---|---|---|
+| id | TEXT PK | ULID |
+| peer_id | TEXT FK | References peers(id) |
+| session_id | TEXT FK | References sessions(id), nullable |
+| note_ids | TEXT | JSON array of note IDs that were surfaced |
+| feedback_type | TEXT | "thumbs_up", "thumbs_down", "correction", "implicit_positive", "implicit_negative" |
+| correction_text | TEXT | For corrections: the replacement content, nullable |
+| created_at | TEXT | Timestamp |
+
+**agent_topic_tracker** — detects agent-introduced topics persisting without organic user mention:
+
+| Column | Type | Description |
+|---|---|---|
+| id | TEXT PK | ULID |
+| peer_id | TEXT FK | References peers(id) |
+| topic_cluster | TEXT | Representative content or embedding ID |
+| consecutive_agent_sessions | INTEGER | Count of sessions with agent mention but no organic mention |
+| last_organic_session_id | TEXT | Session where user last mentioned this topic organically |
+| last_seen_session_id | TEXT | Most recent session where this topic appeared |
+| flagged_for_decay | INTEGER | 1 if consecutive_agent_sessions >= 3 |
+| created_at | TEXT | Timestamp |
+| updated_at | TEXT | Timestamp |
 
 **FTS5** virtual table on (content, context_description, keywords, tags) with sync triggers for INSERT/UPDATE/DELETE. Without triggers, FTS5 returns nothing.
 
@@ -295,6 +347,16 @@ All PKs are TEXT (ULIDs). Timestamps: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
 - `get_colbert_tokens(note_ids) → dict[str, bytes]` — batch fetch token embedding BLOBs for a list of note IDs. Returns {note_id: blob} dict. Missing IDs are omitted.
 - Token embeddings are stored as `numpy.ndarray.tobytes()` and reconstructed with `numpy.frombuffer(...).reshape(num_tokens, COLBERT_TOKEN_DIM)`.
 
+**Q-value and feedback:**
+
+- `update_qvalue(note_id, q_value)` → update q_value column on a single note.
+- `batch_update_qvalues(updates: dict[str, float])` → update q_value for multiple notes. Single transaction.
+- `get_qvalues(peer_id, limit=100)` → return recent notes with their q_values, ordered by created_at desc.
+- `create_feedback_event(id, peer_id, session_id, note_ids, feedback_type, correction_text)` → insert into feedback_events.
+- `get_feedback_events(peer_id, limit=50)` → return recent feedback events.
+- `invalidate_note(note_id, invalidated_by)` → set `is_invalidated=1`, `invalidated_by=<replacement_id>` on the note.
+- `get_notes_by_qvalue(peer_id, limit)` → notes sorted by q_value descending.
+
 ---
 
 ## Embedder / ZvecStore / MemoryAPI
@@ -303,10 +365,11 @@ Already implemented. See source files for details.
 
 **Key facts:**
 - `Embedder.embed_query(text)` prepends `"search_query: "`, returns 384-dim L2-normalized list[float].
+- `Embedder.embed_document(text)` prepends `"search_document: "`, returns 384-dim L2-normalized list[float].
 - `Embedder.embed_documents(texts)` batch version for MMR embedding.
 - `ZvecStore.search(query_embedding, top_k)` returns `[{"id": str, "score": float}, ...]`.
 - Zvec has **no scalar fields/filtering** — returns results across all peers. Post-filter by peer_id after hydrating from SQLite.
-- MemoryAPI gains `retrieve(query, peer_id, limit)` which delegates to the Retriever, and `run_dreamer_cycle(peer_id)` which delegates to the Dreamer orchestrator.
+- MemoryAPI gains `retrieve(query, peer_id, limit)` which delegates to the Retriever, `retrieve_reflective(query, peer_id, limit)` which delegates to the ReflectiveRetriever, `run_dreamer_cycle(peer_id)` which delegates to the Dreamer orchestrator, `record_feedback(peer_id, session_id, note_ids, feedback_type, correction_text)` which delegates to FeedbackProcessor, and `get_feedback_history(peer_id, limit)` which delegates to FeedbackProcessor.
 
 ---
 
@@ -323,7 +386,7 @@ Already implemented. See source files for details.
 
 ## Retrieval Pipeline
 
-No LLM calls. Pure local computation. Target: < 100ms with ColBERT, < 80ms without.
+No LLM calls in the standard path. Pure local computation. Target: < 100ms with ColBERT, < 80ms without. Complex queries via MemR3 reflective loop: 2-4s (1-3 LLM calls).
 
 ```
 Query
@@ -332,15 +395,24 @@ Query
   ├→ Link expansion on top vector hits (BFS depth 1)
   │         ↓
   │    Hydrate from SQLite + peer_id filter
+  │    Exclude invalidated notes (is_invalidated=1)
   │         ↓
   │    RRF Fusion (k=60) across all three streams
   │         ↓
-  │    Score multipliers: decay × provenance × fatigue × inference_discount
+  │    Score multipliers: decay × provenance × fatigue × inference_discount × agent_topic_penalty + Q-value boost
   │         ↓
   │    ColBERT rerank top 50 → top 10
   │    (encode query tokens, load pre-computed doc tokens from SQLite, MaxSim)
   │         ↓
   │    MMR Dedup (cosine > 0.90 → drop lower-scored)
+  │         ↓
+  │    Anti-sycophancy: topic cluster diversity cap (40%)
+  │         ↓
+  │    Anti-sycophancy: epsilon-greedy exploration (p=0.1)
+  │         ↓
+  │    Router: classify as simple or complex
+  │         ↓
+  │    [If complex] MemR3 reflective loop (1-3 iterations)
   │         ↓
   │    Top-N (default 10) → record_access() → return
 ```
@@ -353,7 +425,8 @@ All functions are stateless, no I/O.
 - `compute_provenance_weight(provenance)` — Lookup from `PROVENANCE_WEIGHTS`.
 - `compute_surfacing_fatigue(times_surfaced)` — `1 / (1 + 0.1 * times_surfaced)`
 - `compute_inference_discount(note_type)` — "inference" → 0.7, else → 1.0.
-- `compute_composite_score(rrf_score, decay, provenance, fatigue, inference_discount)` — multiply all factors.
+- `compute_agent_topic_penalty(note_id, flagged_ids)` — 0.5 if the note is in `flagged_ids` (halves its score), 1.0 otherwise.
+- `compute_composite_score(rrf_score, decay, provenance, fatigue, inference_discount, q_boost=0.0, agent_topic_penalty=1.0)` — `base = rrf × decay × provenance × fatigue × inference_discount × agent_topic_penalty; return base + q_boost`. Q-value is additive to prevent a single bad Q from zeroing out a relevant memory.
 
 ### fusion.py — RRF + MMR
 
@@ -362,9 +435,9 @@ All functions are stateless, no I/O.
 
 ### retriever.py — Orchestrator
 
-Steps: parallel search → hydrate → RRF → score → ColBERT rerank (query encode + pre-computed MaxSim) → MMR dedup → truncate → record access → return.
+Steps: parallel search → hydrate → exclude invalidated → RRF → score (with Q-value boost and agent topic penalty) → ColBERT rerank (query encode + pre-computed MaxSim) → MMR dedup → topic diversity cap → epsilon exploration → truncate → record access → return.
 
-**Error handling**: Zvec fails → FTS-only. FTS fails → vector-only. ColBERT fails → skip reranking (no pre-computed tokens for a note → rank it at end). Both search backends fail → empty list.
+**Error handling**: Zvec fails → FTS-only. FTS fails → vector-only. ColBERT fails → skip reranking (no pre-computed tokens for a note → rank it at end). Anti-sycophancy fails → skip (log warning, return results without anti-sycophancy). Both search backends fail → empty list.
 
 ---
 
@@ -375,32 +448,16 @@ Steps: parallel search → hydrate → RRF → score → ColBERT rerank (query e
 Generates typed bidirectional links between notes using embedding cosine similarity.
 
 - `LinkGenerator.__init__(db, zvec, embedder)` — stores references.
-- `LinkGenerator.generate_links(note)` — for a given note, find top `LINK_CANDIDATE_LIMIT` nearest neighbors in Zvec, filter by cosine ≥ `LINK_SIMILARITY_THRESHOLD` (0.75), cap at `LINK_MAX_PER_NOTE` (5), create `"semantic"` links in SQLite. No LLM call — pure embedding math.
-- Called from `handle_derive()` after note creation. Failure does not block note persistence.
+- `LinkGenerator.generate_links(note)` — for a given note, find top `LINK_CANDIDATE_LIMIT` nearest neighbors in Zvec, filter by cosine ≥ `LINK_SIMILARITY_THRESHOLD` (0.75), cap at `LINK_MAX_PER_NOTE` (5), create `"semantic"` links in SQLite.
 
-### colbert_reranker.py — ColBERT Reranking (Pre-computed Token Embeddings)
+### colbert_reranker.py — ColBERT Reranking
 
-Uses `pylate` library with `answerdotai/answerai-colbert-small-v1` (33M params, 96-dim tokens, ~130MB).
-
-**Write-time (pre-computation):**
-- `ColBERTReranker.__init__()` — loads model via `pylate.models.ColBERT(COLBERT_MODEL)`.
-- `ColBERTReranker.encode_document(text) → bytes` — encodes a note's text into token-level embeddings using `model.encode([text], is_query=False)`. Returns the numpy array serialized to bytes via `ndarray.tobytes()` for SQLite BLOB storage.
-- `ColBERTReranker.encode_documents(texts) → list[bytes]` — batch version.
-- Called from `handle_derive()` after note creation. Token embeddings stored in `colbert_tokens` table. Failure does not block note persistence.
-
-**Read-time (reranking):**
-- `ColBERTReranker.rerank(query, candidate_note_ids, db, top_n=10) → list[str]` — encodes query tokens via `model.encode([query], is_query=True)`, loads pre-computed document token BLOBs from `db.get_colbert_tokens(candidate_note_ids)`, reconstructs numpy arrays, computes MaxSim scores via `pylate.rank.rerank()`, returns reranked note_ids.
-- Only the query requires a forward pass (~5ms). Document scoring is pure MaxSim matrix ops (~1-2ms for 50 candidates).
-- Notes without pre-computed tokens (e.g., legacy notes from before Phase 5) are auto-ranked at the end of the list.
-
-**Storage:** each note's token embeddings are ~(num_tokens × 96 × 4) bytes. A typical 50-token note ≈ 19KB raw. With numpy float32.
-
-- Model loaded lazily on first use. Failure → return original ranking (graceful degradation).
-- pylate is sync — wrap with `asyncio.to_thread()`.
+- `ColBERTReranker.__init__()` — loads `answerai-colbert-small-v1` model.
+- `ColBERTReranker.encode_document(text) → bytes` — tokenize + forward pass → (num_tokens, 96) array → `.tobytes()`.
+- `ColBERTReranker.rerank(query, candidates, top_n)` — encode query, load pre-computed doc tokens from SQLite, MaxSim scoring, return top_n.
+- `ColBERTReranker.is_loaded() → bool` — model availability check.
 
 ### profile_generator.py — Static Peer Card
-
-Generates a ~30-fact static profile organized into 4 sections: identity, professional, communication_style, relationships.
 
 - `ProfileGenerator.__init__(db, deriver)` — uses Deriver API (DeepSeek V3.2) for generation.
 - `ProfileGenerator.generate(peer_id)` → JSON dict with 4 sections, each a list of fact strings.
@@ -571,6 +628,186 @@ Entity extraction is called from `handle_derive()` after note creation. It runs 
 
 ---
 
+## Refinement Layer
+
+### MemRL Q-Value Tracking (refinement/qvalue.py)
+
+Learned utility score per memory. Updated by user feedback via temporal-difference updates. Integrated into the composite score as an additive factor after RRF fusion.
+
+**`QValueTracker.__init__(db)`** — stores SQLiteStore reference.
+
+**`QValueTracker.update(note_id, reward) → float`** — applies temporal-difference update:
+```
+Q_new = (1 - α) × Q_old + α × reward
+```
+Where `α = QVALUE_LEARNING_RATE` (0.1). Returns the new Q-value. Writes to SQLite.
+
+**`QValueTracker.batch_update(note_ids, reward) → dict[str, float]`** — applies the same update to multiple notes. Returns `{note_id: new_q_value}`. Single transaction.
+
+**`QValueTracker.normalize_qvalues(peer_id) → dict[str, float]`** — z-score normalization across the peer's recent notes. Uses `QVALUE_ZSCORE_WINDOW` (last 100 notes by created_at). If fewer than `QVALUE_ZSCORE_MIN_SAMPLES` (10), returns raw Q-values unchanged. Formula: `q_normalized = (q - mean) / max(std, 1e-8)`. Returns `{note_id: normalized_q}`.
+
+**`QValueTracker.get_qvalue_boost(note_id, peer_id) → float`** — returns the Q-value contribution for composite scoring. Normalizes via z-score, then scales: `boost = normalized_q × QVALUE_WEIGHT_IN_COMPOSITE`. Clamped to [-0.3, 0.3] to prevent Q-values from dominating.
+
+**Integration into retriever.py**: After computing composite_score (decay × provenance × fatigue × inference_discount), add Q-value boost:
+```python
+composite = rrf × decay × provenance × fatigue × inference_discount × agent_topic_penalty
+qboost = qvalue_tracker.get_qvalue_boost(note.id, peer_id)
+final_score = composite + qboost  # additive, not multiplicative
+```
+
+### User Feedback Ingestion (refinement/feedback.py)
+
+Processes explicit and implicit feedback signals, routing them to Q-value updates and memory corrections.
+
+**`FeedbackProcessor.__init__(db, qvalue_tracker, embedder, zvec)`** — stores references.
+
+**`FeedbackProcessor.record_thumbs_up(peer_id, session_id, note_ids)`** — records feedback event, calls `qvalue_tracker.batch_update(note_ids, QVALUE_POSITIVE_REWARD)`.
+
+**`FeedbackProcessor.record_thumbs_down(peer_id, session_id, note_ids)`** — records feedback event, calls `qvalue_tracker.batch_update(note_ids, QVALUE_NEGATIVE_REWARD)`.
+
+**`FeedbackProcessor.record_implicit(peer_id, session_id, note_ids, signal_type)`** — `signal_type` is `"positive"` (engaged response) or `"negative"` (topic change). Uses `QVALUE_IMPLICIT_POSITIVE` or `QVALUE_IMPLICIT_NEGATIVE`.
+
+**`FeedbackProcessor.record_correction(peer_id, session_id, note_id, correction_text) → Note`** — the memory correction flow:
+1. Set `is_invalidated=1` on the contradicted note, drop its confidence to `FEEDBACK_CORRECTION_CONFIDENCE` (0.3).
+2. Create a replacement note with `provenance="user_confirmed"`, `confidence=1.0`, `correction_of=note_id`.
+3. Embed the replacement and store in Zvec.
+4. Apply `QVALUE_NEGATIVE_REWARD` to the invalidated note.
+5. Return the new replacement note.
+
+**`FeedbackProcessor.get_feedback_history(peer_id, limit=50) → list[FeedbackEvent]`** — returns recent feedback for analytics.
+
+### Memory Correction Flow (refinement/correction.py)
+
+Handles conversational corrections where the user contradicts an existing memory.
+
+**`CorrectionHandler.__init__(db, embedder, zvec, feedback_processor)`**
+
+**`CorrectionHandler.detect_correction(user_message, surfaced_note_ids, peer_id) → CorrectionCandidate | None`** — uses embedding similarity between the user's message and surfaced notes. If any surfaced note has cosine similarity > 0.6 to the user message AND the user message contains correction signals (negation words: "no", "actually", "that's wrong", "that's not right", "I meant", "correction", "wrong", "incorrect"), returns a `CorrectionCandidate(note_id, correction_text, confidence)`. Pure heuristic — no LLM call.
+
+**`CorrectionCandidate`** — dataclass: `note_id: str`, `correction_text: str`, `confidence: float`.
+
+**`CorrectionHandler.apply_correction(candidate, peer_id, session_id) → Note`** — delegates to `feedback_processor.record_correction()`.
+
+### Adaptive Retrieval Router (refinement/router.py)
+
+Classifies queries as simple or complex to decide whether to use the standard retrieval pipeline or trigger the MemR3 reflective loop.
+
+**`RetrievalRouter.__init__(embedder)`** — stores embedder reference.
+
+**`RetrievalRouter.classify(query, candidates) → str`** — returns `"simple"` or `"complex"`. Classification signals:
+
+1. **Score spread**: compute `max_score - min_score` across top candidates. Below `ROUTER_SIMPLE_THRESHOLD` (0.6) → likely complex (all results are mediocre matches).
+2. **Embedding distance distribution**: compute the mean and std of cosine distances between query and top results. If mean distance > `ROUTER_DISTANCE_PERCENTILE`-th percentile of the peer's historical distances → complex (query is unlike stored memories).
+3. **Query structure heuristics**: multi-hop indicators ("how many", "compare", "between X and Y", temporal references spanning multiple events) → complex. Direct lookup patterns ("what is", "who is", single-entity questions) → simple.
+4. **Candidate count**: fewer than `ROUTER_MIN_CANDIDATES` (3) results above a minimum score → complex (insufficient evidence).
+
+Returns `"complex"` if 2+ signals fire, `"simple"` otherwise. Default to `"simple"` on any classification error.
+
+**Expected ratio**: ~88% simple, ~12% complex based on typical conversational query distributions.
+
+### MemR3 Reflective Loop (refinement/reflective.py)
+
+Closed-loop retrieval controller for complex queries. Wraps the existing Retriever and adds an evidence-gap tracker with retrieve/reflect/answer routing.
+
+**`ReflectiveRetriever.__init__(retriever, router, deriver_client, embedder)`** — stores references. `deriver_client` is used for the reflect step (DeepSeek V3.2 via NousResearch, same endpoint as the Deriver).
+
+**`ReflectiveRetriever.retrieve(query, peer_id, limit=10) → ReflectiveResult`** — the main entry point:
+
+1. Run initial retrieval via `self._retriever.retrieve(query, peer_id)`.
+2. Call `router.classify(query, results)`. If `"simple"` → return results directly as `ReflectiveResult`.
+3. If `"complex"` → enter the reflective loop.
+
+**Reflective loop** (max `MEMR3_MAX_ITERATIONS` = 3 iterations):
+
+```
+Initialize:
+  evidence = {}     # note_id → content (what we know)
+  gaps = [query]    # what we still need (starts as the original query)
+  mask_ids = set()  # IDs already retrieved (to prevent re-retrieval)
+  iteration = 0
+
+Loop:
+  1. RETRIEVE: run retriever with refined query (gaps → query reformulation)
+     - Mask: exclude results where cosine(result, any masked) > MEMR3_MASK_THRESHOLD
+     - Add non-masked results to evidence, add their IDs to mask_ids
+
+  2. REFLECT: call DeepSeek V3.2 with prompt containing:
+     - Original query
+     - Current evidence (all gathered so far)
+     - Current gaps
+     - Ask: "What evidence is confirmed? What is still missing? Should we retrieve more or answer now?"
+     - Output: updated evidence dict, updated gaps list, action ("retrieve" | "answer")
+     - Temperature: MEMR3_REFLECT_TEMPERATURE (0.1)
+     - Retry: MEMR3_REFLECT_MAX_RETRIES (2) with same backoff as Deriver
+
+  3. ROUTE:
+     - If action == "answer" OR gaps is empty OR iteration >= max → break
+     - If action == "retrieve" → reformulate query from gaps, continue loop
+
+  iteration += 1
+```
+
+**`ReflectiveResult`** — Pydantic model: `results: list[RetrievalResult]`, `is_complex: bool`, `iterations: int`, `evidence: dict[str, str]`, `gaps: list[str]`, `latency_ms: float`.
+
+**Reflect prompt** (stored as a constant in `refinement/reflective.py`):
+```
+You are analyzing retrieved memories to answer a question.
+
+Question: {query}
+
+Evidence gathered so far:
+{evidence_text}
+
+Gaps (information still needed):
+{gaps_text}
+
+Respond with JSON only:
+{
+  "evidence": {"note_id": "confirmed fact", ...},
+  "gaps": ["what is still missing", ...],
+  "action": "retrieve" | "answer",
+  "refined_query": "if action is retrieve, the next search query"
+}
+```
+
+**Error handling**: If the reflect LLM call fails, break the loop and return whatever evidence was gathered. The reflective loop is best-effort — failure falls back to standard retrieval results.
+
+### Anti-Sycophancy Guards (refinement/antisycophancy.py)
+
+Five defensive layers preventing memory-powered personalization from creating self-reinforcing feedback loops.
+
+**Layer 1 — Provenance-weighted scoring** (implemented in scorer.py): organic=1.0, user_confirmed=0.8, agent_prompted=0.5, inferred=0.3.
+
+**Layer 2 — Topic cluster diversity cap**:
+
+**`enforce_topic_diversity(results, embedder, cap=ANTISYC_TOPIC_CLUSTER_CAP) → list[RetrievalResult]`** — clusters the result set by embedding similarity (threshold `ANTISYC_CLUSTER_SIMILARITY` = 0.75, same union-find approach as dedup). If any cluster exceeds `cap` (40%) of the result set, drops the lowest-scored members of that cluster until the cap is met. Dropped slots are filled by the next-best results from other clusters if available. If only one cluster exists, return as-is — do not drop below 1 result.
+
+**Layer 3 — Epsilon-greedy exploration**:
+
+**`apply_epsilon_exploration(results, peer_id, db, epsilon=ANTISYC_EPSILON) → list[RetrievalResult]`** — with probability `epsilon` (0.1), replace the lowest-scored result in the list with a random note from the peer's memory (excluding notes already in the result set). The random note must have `is_invalidated=0`. If the random pick fails (no eligible notes), skip exploration for this query. Returns the modified results. Random notes are wrapped in RetrievalResult with `score=0.0` and `source="exploration"`.
+
+**Layer 4 — Anti-sycophancy system prompt**:
+
+**`generate_antisycophancy_prompt(profile_text, memory_count) → str`** — returns a system prompt fragment to append when memory context is injected:
+```
+The following memories are provided for context only. Do not:
+- Assume these memories represent the user's current views or interests
+- Proactively introduce topics merely because they appear in memory
+- Agree with positions in memory without the user raising them
+- Treat memory-derived facts as more reliable than the user's current statements
+If the user contradicts a memory, trust the user's current statement.
+```
+
+**Layer 5 — Agent-topic decay flagging**:
+
+**`AgentTopicTracker.__init__(db)`**
+
+**`AgentTopicTracker.track_session(peer_id, session_id, organic_topics, agent_topics)`** — `organic_topics` = topic embeddings from user-originated notes this session. `agent_topics` = topic embeddings from agent-originated context. For each agent topic: if it matches an existing tracked topic (cosine > 0.75), increment `consecutive_agent_sessions`. If it also appears in `organic_topics`, reset `consecutive_agent_sessions` to 0 and update `last_organic_session_id`. If `consecutive_agent_sessions >= ANTISYC_AGENT_TOPIC_DECAY_SESSIONS` (3), set `flagged_for_decay=1`.
+
+**`AgentTopicTracker.get_flagged_notes(peer_id) → list[str]`** — returns note IDs associated with flagged topics. These notes get an additional decay penalty applied during scoring (0.5× via `compute_agent_topic_penalty`).
+
+---
+
 ## Models
 
 ### RetrievalResult (models.py)
@@ -583,7 +820,36 @@ class RetrievalResult(BaseModel):
     decay_strength: float
     provenance_weight: float
     fatigue_factor: float
-    source: str               # "fts" | "vector" | "both" | "link"
+    inference_discount: float = 1.0
+    colbert_score: float | None = None
+    q_value_boost: float = 0.0
+    agent_topic_penalty: float = 1.0
+    source: str               # "fts" | "vector" | "both" | "link" | "exploration"
+```
+
+### ReflectiveResult (models.py)
+
+```python
+class ReflectiveResult(BaseModel):
+    results: list[RetrievalResult]
+    is_complex: bool = False
+    iterations: int = 0
+    evidence: dict[str, str] = {}
+    gaps: list[str] = []
+    latency_ms: float = 0.0
+```
+
+### FeedbackEvent (models.py)
+
+```python
+class FeedbackEvent(BaseModel):
+    id: str
+    peer_id: str
+    session_id: str | None = None
+    note_ids: list[str]
+    feedback_type: str   # "thumbs_up" | "thumbs_down" | "correction" | "implicit_positive" | "implicit_negative"
+    correction_text: str | None = None
+    created_at: str
 ```
 
 ---
@@ -600,8 +866,17 @@ class RetrievalResult(BaseModel):
 | RRF + scoring | < 1ms | Pure math, ~60 candidates |
 | ColBERT rerank | ~5-7ms | Query encode ~5ms + MaxSim ~1-2ms (pre-computed docs) |
 | MMR dedup | ~20-50ms | Batch embed + dot products |
-| **Full retrieval (with ColBERT)** | **< 100ms** | **User-facing, pre-computed tokens** |
-| **Full retrieval (without ColBERT)** | **< 80ms** | **Fallback** |
+| Anti-sycophancy (topic diversity) | < 5ms | Pairwise cosine on ~10 results |
+| Anti-sycophancy (epsilon exploration) | < 2ms | Random pick from SQLite |
+| Q-value update (single note) | < 1ms | SQLite write |
+| Q-value normalization | < 5ms | Read + compute |
+| Router classification | < 2ms | Pure math + heuristics |
+| **Full retrieval (simple, with ColBERT)** | **< 100ms** | **User-facing, pre-computed tokens** |
+| **Full retrieval (simple, without ColBERT)** | **< 80ms** | **Fallback** |
+| MemR3 reflective loop (per iteration) | ~1-1.5s | One LLM call for reflect |
+| **Full retrieval (complex, MemR3)** | **< 4s** | **1-3 iterations** |
+| Feedback recording | < 2ms | SQLite insert + Q-value update |
+| Memory correction flow | < 50ms | Invalidate + create + embed |
 | Batch dedup (100 notes) | ~100ms | Start of Dreamer cycle |
 | Dreamer cycle | < 24h | Batch API SLO, typically much faster |
 
@@ -610,7 +885,7 @@ class RetrievalResult(BaseModel):
 ## Environment Variables
 
 ```bash
-export NOUSRESEARCH_API_KEY="your-key"   # Required for Deriver
+export NOUSRESEARCH_API_KEY="your-key"   # Required for Deriver and MemR3 reflect step
 export GEMINI_API_KEY="your-key"         # Required for Dreamer
 ```
 
@@ -633,9 +908,9 @@ All use `tmp_path`. All API calls mocked.
 - **test_write_pipeline.py**: full round trip ingest→derive→notes in SQLite+Zvec+FTS5.
 
 ### Retrieval
-- **test_scorer.py**: decay disabled < 100, ramps 100–1000, high-importance floor, provenance weights, fatigue decreasing, composite multiplies.
+- **test_scorer.py**: decay disabled < 100, ramps 100–1000, high-importance floor, provenance weights, fatigue decreasing, composite multiplies, Q-value boost additive, agent topic penalty halves score.
 - **test_fusion.py**: RRF overlapping > non-overlapping, MMR drops > 0.90, order preserved, missing embeddings auto-accepted.
-- **test_retriever.py**: basic retrieval, source="both", peer isolation, access tracking, empty results, fallbacks, MMR dedup, provenance/decay ordering, limit respected.
+- **test_retriever.py**: basic retrieval, source="both", peer isolation, access tracking, empty results, fallbacks, MMR dedup, provenance/decay ordering, limit respected, invalidated notes excluded.
 - **test_retrieval_pipeline.py**: end-to-end write-then-read, multiple sessions, surfacing fatigue, mixed provenance.
 
 ### Intelligence Layer
@@ -650,6 +925,15 @@ All use `tmp_path`. All API calls mocked.
 - **test_magma.py**: extract_entities finds capitalized names, add_note_entities persists to SQLite, get_related_entities returns connected nodes, get_communities returns groups, empty graph returns empty lists.
 - **test_dreamer_pipeline.py**: end-to-end with mocked Gemini — buffer notes → dedup → dream → verify links/patterns/profile created. Entity mentions stored. Contradictions create links.
 
+### Refinement
+- **test_qvalue.py**: default Q-value is 0.0, positive update increases, negative decreases asymmetrically, batch update applies to all, z-score normalization with sufficient samples, normalization skipped below min_samples, Q-value boost clamped to [-0.3, 0.3], composite score changes with Q-value.
+- **test_reflective.py**: simple query skips loop, complex query triggers loop, evidence-gap tracker accumulates across iterations, mask prevents re-retrieval of same notes, early stopping when gaps empty, early stopping at max iterations, reflect LLM failure falls back gracefully, latency tracked.
+- **test_router.py**: high score spread → simple, low score spread → complex, multi-hop query patterns → complex, single-entity patterns → simple, few candidates → complex, classification error defaults to simple.
+- **test_feedback.py**: thumbs up increases Q-value, thumbs down decreases Q-value (asymmetric), correction invalidates note and creates replacement, correction note has user_confirmed provenance, implicit signals apply small deltas, feedback events persisted to SQLite.
+- **test_correction.py**: detect_correction finds contradiction with signal words, detect_correction returns None without signal words, detect_correction returns None with low similarity, apply_correction delegates correctly.
+- **test_antisycophancy.py**: topic cluster cap enforced at 40%, epsilon exploration replaces lowest with random, agent-topic tracker increments consecutive sessions, agent-topic tracker resets on organic mention, flagged notes get penalty in scoring, epsilon exploration skips when no eligible random notes.
+- **test_refinement_pipeline.py**: end-to-end feedback → Q-value → next retrieval reranks correctly, correction flow → old note deprioritized + new note surfaces, anti-sycophancy layers compose without breaking retrieval order.
+
 ---
 
 ## Design Principles
@@ -659,8 +943,13 @@ All use `tmp_path`. All API calls mocked.
 3. **Frequency ≠ importance.** Two-dimensional scoring prevents topic domination.
 4. **Decay scores, never deletes.** All data preserved; relevance is temporal.
 5. **Agent responses are context, not memory.** Read but never stored as user attributes.
-6. **Graceful degradation.** If one search backend or the Dreamer fails, the system continues.
-7. **No LLM calls in the read path.** ColBERT is a local model, not an API call.
+6. **Graceful degradation.** If one search backend, the Dreamer, or the reflective loop fails, the system continues.
+7. **No LLM calls in the standard read path.** ColBERT is a local model, not an API call. MemR3 only fires for complex queries (~12%).
 8. **No expertise in static profile.** Prevents model over-anchoring. Expertise lives in dynamic notes.
 9. **Batch dedup before Dreamer.** Preserves frequency as an importance signal while preventing the Dreamer from being overwhelmed by repetition.
 10. **Entity extraction is best-effort.** Rule-based, no LLM. Failure never blocks note creation.
+11. **Q-values are additive, not multiplicative.** Prevents a single bad Q-value from zeroing out an otherwise relevant memory.
+12. **The reflective loop is best-effort.** LLM failure in the reflect step falls back to standard retrieval, never blocks the response.
+13. **Anti-sycophancy guards compose independently.** Each layer can be disabled without affecting the others.
+14. **Memory corrections trust the user.** A user correction always wins over LLM-derived observations.
+15. **Routing defaults to simple.** Classification errors never trigger the expensive reflective loop.
